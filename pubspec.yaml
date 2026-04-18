@@ -23,6 +23,19 @@ dev_dependencies:
   flutter_test:
     sdk: flutter
   flutter_lints: ^6.0.0
+  msix: ^3.16.13
+
+msix_config:
+  display_name: Flora
+  publisher_display_name: Gero Studios
+  identity_name: com.gerostudios.flora
+  msix_version: 0.1.0.1
+  logo_path: assets/logo.png
+  trim_logo: false
+  capabilities: internetClient
+  install_certificate: false
+  output_name: Flora
+  output_path: dist/windows/msix
 
 flutter:
   uses-material-design: true

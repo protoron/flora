@@ -29,8 +29,29 @@ flutter pub get
 flutter run
 ```
 
+## Windows Releases
+
+Flora can be packaged as a normal Windows desktop build or as an installer.
+
+Portable release build:
+
+```powershell
+flutter build windows --release
+```
+
+The release executable is generated in `build/windows/x64/runner/Release/`.
+
+Installer build:
+
+```powershell
+scripts\build-windows-release.bat
+```
+
+That script runs `flutter pub get`, builds the Windows release, creates an MSIX installer, and also writes a portable zip bundle under `dist/windows/`.
+
 ## Notes
 
 - The preview experience is optimized for desktop use.
 - Web preview is the best fit for embedded rendering inside Flora.
 - Project settings are stored locally so your workspace feels consistent between sessions.
+- If you distribute the MSIX outside a developer machine, you should sign it with a real certificate for a smoother install experience.

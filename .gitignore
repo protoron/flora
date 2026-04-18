@@ -37,6 +37,10 @@ migrate_working_dir/
 .pub/
 /build/
 /coverage/
+/dist/
+*.msix
+*.msixbundle
+*.appinstaller
 
 # Symbolication related
 app.*.symbols
