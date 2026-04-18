@@ -245,17 +245,17 @@ class _StatusBar extends ConsumerWidget {
 
   @override
   Widget build(BuildContext context, WidgetRef ref) {
-  final selectedAssistant = ref.watch(assistantProvider);
-  final usingCodex = selectedAssistant == AssistantProviderType.codex;
-  final providerInstalled = usingCodex
-    ? ref.watch(codexInstalledProvider)
-    : ref.watch(copilotInstalledProvider);
-  final providerReady = usingCodex
-    ? ref.watch(codexAuthenticatedProvider)
-    : ref.watch(copilotAuthenticatedProvider);
-  final providerLabel = usingCodex
-    ? ref.watch(codexAuthLabelProvider)
-    : ref.watch(copilotAuthLabelProvider);
+    final selectedAssistant = ref.watch(assistantProvider);
+    final usingCodex = selectedAssistant == AssistantProviderType.codex;
+    final providerInstalled = usingCodex
+        ? ref.watch(codexInstalledProvider)
+        : ref.watch(copilotInstalledProvider);
+    final providerReady = usingCodex
+        ? ref.watch(codexAuthenticatedProvider)
+        : ref.watch(copilotAuthenticatedProvider);
+    final providerLabel = usingCodex
+        ? ref.watch(codexAuthLabelProvider)
+        : ref.watch(copilotAuthLabelProvider);
     final root = ref.watch(projectRootProvider);
     final active = ref.watch(activeFilePathProvider);
 
@@ -294,11 +294,19 @@ class _StatusBar extends ConsumerWidget {
               ),
               if (active != null) ...[
                 const _StatusDot(color: FloraPalette.textSecondary),
-                Text(
-                  active.split(RegExp(r'[/\\]')).last,
-                  style: const TextStyle(
-                    color: FloraPalette.textSecondary,
-                    fontSize: 12,
+                Flexible(
+                  fit: FlexFit.loose,
+                  child: Tooltip(
+                    message: active,
+                    child: Text(
+                      active,
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: const TextStyle(
+                        color: FloraPalette.textSecondary,
+                        fontSize: 12,
+                      ),
+                    ),
                   ),
                 ),
               ],

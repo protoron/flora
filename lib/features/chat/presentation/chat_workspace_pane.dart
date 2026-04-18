@@ -253,6 +253,8 @@ class _ChatWorkspacePaneState extends ConsumerState<ChatWorkspacePane> {
       projectRoot: projectRoot,
       assistantProvider: selectedAssistant,
     );
+    final assistantMessageId = '${DateTime.now().millisecondsSinceEpoch}_a';
+    final now = DateTime.now();
 
     _inputCtrl.clear();
 
@@ -266,9 +268,23 @@ class _ChatWorkspacePaneState extends ConsumerState<ChatWorkspacePane> {
       reasoningEffort: selectedReasoningEffort,
       assistantProvider: selectedAssistant,
     );
+    final streamingMsg = ChatMessage(
+      id: assistantMessageId,
+      role: MessageRole.assistant,
+      content: 'Thinking…',
+      timestamp: now,
+      inspectorAttachment: inspectorSelection,
+      model: selectedModel,
+      reasoningEffort: selectedReasoningEffort,
+      assistantProvider: selectedAssistant,
+      thoughts: const [],
+      debugLines: const [],
+      isStreaming: true,
+    );
+
     ref
         .read(chatHistoryProvider.notifier)
-        .update((state) => [...state, userMsg]);
+        .update((state) => [...state, userMsg, streamingMsg]);
     ref.read(chatLoadingProvider.notifier).state = true;
     _scrollToBottom();
 
@@ -277,18 +293,23 @@ class _ChatWorkspacePaneState extends ConsumerState<ChatWorkspacePane> {
       _pushProviderStatus(selectedAssistant, statusBefore);
 
       final startedAt = DateTime.now();
+
       final result = selectedAssistant == AssistantProviderType.codex
           ? await CodexCliService.execPrompt(
               prompt: prompt,
               workingDirectory: projectRoot,
               model: selectedModel,
               reasoningEffort: selectedReasoningEffort,
+              onProgress: (update) =>
+                  _handleProgressUpdate(assistantMessageId, update),
             )
           : await CopilotCliService.execPrompt(
               prompt: prompt,
               workingDirectory: projectRoot,
               model: selectedModel,
               reasoningEffort: selectedReasoningEffort,
+              onProgress: (update) =>
+                  _handleProgressUpdate(assistantMessageId, update),
             );
       final durationMs = DateTime.now().difference(startedAt).inMilliseconds;
 
@@ -306,8 +327,6 @@ class _ChatWorkspacePaneState extends ConsumerState<ChatWorkspacePane> {
           : (result.combinedOutput.trim().isEmpty
                 ? '${selectedAssistant.label} returned no output.'
                 : result.combinedOutput);
-      final thoughts = [...result.modelThoughts];
-
       final completionMessage = result.completionMessage?.trim() ?? '';
       final completionStatus = result.success
           ? '${selectedAssistant.label} completed in ${durationMs}ms (exit ${result.exitCode ?? 0}).'
@@ -337,7 +356,7 @@ class _ChatWorkspacePaneState extends ConsumerState<ChatWorkspacePane> {
       ];
 
       final assistantMsg = ChatMessage(
-        id: '${DateTime.now().millisecondsSinceEpoch}_a',
+        id: assistantMessageId,
         role: MessageRole.assistant,
         content: content,
         timestamp: DateTime.now(),
@@ -345,19 +364,18 @@ class _ChatWorkspacePaneState extends ConsumerState<ChatWorkspacePane> {
         model: selectedModel,
         reasoningEffort: selectedReasoningEffort,
         assistantProvider: selectedAssistant,
-        thoughts: thoughts,
         completionSummary: completionSummary,
         debugLines: debugLines.take(24).toList(),
+        thoughts: result.modelThoughts,
+        isStreaming: false,
       );
-      ref
-          .read(chatHistoryProvider.notifier)
-          .update((state) => [...state, assistantMsg]);
+      _replaceChatMessage(assistantMessageId, (_) => assistantMsg);
 
       // Trigger hot reload after every completed Codex message.
       ref.read(hotReloadTriggerProvider.notifier).update((count) => count + 1);
     } catch (error) {
       final assistantMsg = ChatMessage(
-        id: '${DateTime.now().millisecondsSinceEpoch}_e',
+        id: assistantMessageId,
         role: MessageRole.assistant,
         content: '${selectedAssistant.label} request failed: $error',
         timestamp: DateTime.now(),
@@ -368,14 +386,49 @@ class _ChatWorkspacePaneState extends ConsumerState<ChatWorkspacePane> {
         completionSummary:
             '${selectedAssistant.label} execution failed before completion.',
         debugLines: ['exception $error'],
+        thoughts: const [],
+        isStreaming: false,
       );
-      ref
-          .read(chatHistoryProvider.notifier)
-          .update((state) => [...state, assistantMsg]);
+      _replaceChatMessage(assistantMessageId, (_) => assistantMsg);
     } finally {
       ref.read(chatLoadingProvider.notifier).state = false;
       _scrollToBottom();
     }
+  }
+
+  void _replaceChatMessage(
+    String id,
+    ChatMessage Function(ChatMessage message) transform,
+  ) {
+    final history = ref.read(chatHistoryProvider);
+    final index = history.indexWhere((message) => message.id == id);
+    if (index == -1) {
+      return;
+    }
+
+    final updated = [...history];
+    updated[index] = transform(updated[index]);
+    ref.read(chatHistoryProvider.notifier).state = updated;
+  }
+
+  void _handleProgressUpdate(
+    String assistantMessageId,
+    AssistantExecutionUpdate update,
+  ) {
+    if (!mounted) {
+      return;
+    }
+
+    _replaceChatMessage(
+      assistantMessageId,
+      (message) => message.copyWith(
+        content: update.status,
+        thoughts: update.thoughts,
+        debugLines: update.events,
+        isStreaming: !update.isFinal,
+      ),
+    );
+    _scrollToBottom();
   }
 
   void _scrollToBottom() {
@@ -545,7 +598,6 @@ class _ChatBody extends ConsumerWidget {
   @override
   Widget build(BuildContext context, WidgetRef ref) {
     final messages = ref.watch(chatHistoryProvider);
-    final loading = ref.watch(chatLoadingProvider);
     final active = ref.watch(activeFilePathProvider);
     final root = ref.watch(projectRootProvider);
     final inspectorSelection = ref.watch(inspectorSelectionProvider);
@@ -574,11 +626,8 @@ class _ChatBody extends ConsumerWidget {
                   : ListView.builder(
                       controller: scrollCtrl,
                       padding: const EdgeInsets.fromLTRB(8, 76, 8, 8),
-                      itemCount: messages.length + (loading ? 1 : 0),
+                      itemCount: messages.length,
                       itemBuilder: (context, index) {
-                        if (index == messages.length) {
-                          return const _TypingIndicator();
-                        }
                         return _MessageTile(message: messages[index]);
                       },
                     ),
@@ -911,6 +960,8 @@ class _MessageTile extends StatelessWidget {
     final showCompletion =
         message.completionSummary != null &&
         message.completionSummary!.trim().isNotEmpty;
+    final showThoughts = message.thoughts.isNotEmpty;
+    final showDebug = message.debugLines.isNotEmpty && !message.isStreaming;
 
     return Align(
       alignment: isUser ? Alignment.centerRight : Alignment.centerLeft,
@@ -940,6 +991,30 @@ class _MessageTile extends StatelessWidget {
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
+            if (message.isStreaming) ...[
+              Row(
+                children: [
+                  Container(
+                    width: 8,
+                    height: 8,
+                    decoration: const BoxDecoration(
+                      color: FloraPalette.accent,
+                      shape: BoxShape.circle,
+                    ),
+                  ),
+                  const SizedBox(width: 6),
+                  const Text(
+                    'Thinking live',
+                    style: TextStyle(
+                      color: FloraPalette.textSecondary,
+                      fontSize: 11,
+                      fontWeight: FontWeight.w600,
+                    ),
+                  ),
+                ],
+              ),
+              const SizedBox(height: 8),
+            ],
             _buildContent(message.content),
             if (message.inspectorAttachment != null) ...[
               const SizedBox(height: 8),
@@ -947,11 +1022,13 @@ class _MessageTile extends StatelessWidget {
                 selection: message.inspectorAttachment!,
               ),
             ],
-            if (message.thoughts.isNotEmpty) ...[
+            if (showThoughts) ...[
               const SizedBox(height: 8),
               _MessageMetaBlock(
                 icon: Icons.psychology_alt_outlined,
-                title: 'Model thoughts',
+                title: message.isStreaming
+                    ? 'Live thoughts'
+                    : 'Condensed thoughts',
                 lines: message.thoughts,
               ),
             ],
@@ -963,7 +1040,7 @@ class _MessageTile extends StatelessWidget {
                 lines: [message.completionSummary!.trim()],
               ),
             ],
-            if (message.debugLines.isNotEmpty) ...[
+            if (showDebug) ...[
               const SizedBox(height: 8),
               _MessageMetaBlock(
                 icon: Icons.bug_report_outlined,
@@ -1189,88 +1266,6 @@ class _MessageMetaBlock extends StatelessWidget {
               ),
             ),
         ],
-      ),
-    );
-  }
-}
-
-class _TypingIndicator extends StatelessWidget {
-  const _TypingIndicator();
-
-  @override
-  Widget build(BuildContext context) {
-    return Align(
-      alignment: Alignment.centerLeft,
-      child: Container(
-        margin: const EdgeInsets.only(left: 10, top: 4, bottom: 4),
-        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
-        decoration: BoxDecoration(
-          color: FloraPalette.panelBg,
-          border: Border.all(color: FloraPalette.border),
-          borderRadius: const BorderRadius.only(
-            topLeft: Radius.circular(18),
-            topRight: Radius.circular(18),
-            bottomLeft: Radius.circular(6),
-            bottomRight: Radius.circular(18),
-          ),
-        ),
-        child: const Row(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            SizedBox(width: 6),
-            _Dot(delay: Duration.zero),
-            SizedBox(width: 4),
-            _Dot(delay: Duration(milliseconds: 200)),
-            SizedBox(width: 4),
-            _Dot(delay: Duration(milliseconds: 400)),
-            SizedBox(width: 6),
-          ],
-        ),
-      ),
-    );
-  }
-}
-
-class _Dot extends StatefulWidget {
-  const _Dot({required this.delay});
-
-  final Duration delay;
-
-  @override
-  State<_Dot> createState() => _DotState();
-}
-
-class _DotState extends State<_Dot> with SingleTickerProviderStateMixin {
-  late final AnimationController _controller;
-  late final Animation<double> _animation;
-
-  @override
-  void initState() {
-    super.initState();
-    _controller = AnimationController(
-      vsync: this,
-      duration: const Duration(milliseconds: 600),
-    )..repeat(reverse: true);
-    _animation = CurvedAnimation(parent: _controller, curve: Curves.easeInOut);
-  }
-
-  @override
-  void dispose() {
-    _controller.dispose();
-    super.dispose();
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    return FadeTransition(
-      opacity: _animation,
-      child: Container(
-        width: 5,
-        height: 5,
-        decoration: const BoxDecoration(
-          color: FloraPalette.textSecondary,
-          shape: BoxShape.circle,
-        ),
       ),
     );
   }

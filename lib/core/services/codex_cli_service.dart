@@ -4,6 +4,8 @@ import 'dart:io';
 
 import 'package:path/path.dart' as p;
 
+import '../models/flora_models.dart';
+
 enum CodexAuthMode { missing, loggedOut, chatgpt, apiKey, unknown }
 
 class CodexCliStatus {
@@ -151,6 +153,7 @@ class CodexCliService {
     required String workingDirectory,
     String model = 'gpt-5.4-mini',
     String reasoningEffort = 'medium',
+    void Function(AssistantExecutionUpdate update)? onProgress,
   }) async {
     Directory? tempDir;
     final normalizedModel = model.trim().isEmpty
@@ -192,13 +195,29 @@ class CodexCliService {
       final eventTimeline = <String>[];
       final modelThoughts = <String>[];
       String completionMessage = '';
+      String statusLine = 'Starting Codex…';
+
+      void emitProgress({String? status, bool isFinal = false}) {
+        if (status != null && status.trim().isNotEmpty) {
+          statusLine = status.trim();
+        }
+
+        onProgress?.call(
+          AssistantExecutionUpdate(
+            status: statusLine,
+            thoughts: _tail(modelThoughts, 4),
+            events: _tail(eventTimeline, 8),
+            isFinal: isFinal,
+          ),
+        );
+      }
 
       final stdoutDone = process.stdout
           .transform(utf8.decoder)
           .transform(const LineSplitter())
           .listen((line) {
             stdoutBuffer.writeln(line);
-            _captureJsonEvent(
+            final progressStatus = _captureJsonEvent(
               line: line,
               eventTimeline: eventTimeline,
               modelThoughts: modelThoughts,
@@ -208,6 +227,7 @@ class CodexCliService {
                 }
               },
             );
+            emitProgress(status: progressStatus);
           })
           .asFuture<void>();
       final stderrDone = process.stderr
@@ -218,9 +238,11 @@ class CodexCliService {
             if (line.trim().isNotEmpty) {
               eventTimeline.add('stderr: ${line.trim()}');
             }
+            emitProgress(status: 'Running Codex…');
           })
           .asFuture<void>();
 
+      emitProgress(status: 'Submitting prompt…');
       process.stdin.write(prompt);
       await process.stdin.close();
 
@@ -237,6 +259,8 @@ class CodexCliService {
       if (trimmedFinal.isNotEmpty) {
         completionMessage = trimmedFinal;
       }
+
+      emitProgress(status: 'Wrapping up…', isFinal: true);
 
       final resolvedStdout = trimmedFinal.isNotEmpty
           ? finalMessage
@@ -306,7 +330,7 @@ class CodexCliService {
     return allowed.contains(effort) ? effort : 'medium';
   }
 
-  static void _captureJsonEvent({
+  static String? _captureJsonEvent({
     required String line,
     required List<String> eventTimeline,
     required List<String> modelThoughts,
@@ -314,7 +338,7 @@ class CodexCliService {
   }) {
     final trimmed = line.trim();
     if (trimmed.isEmpty) {
-      return;
+      return null;
     }
 
     dynamic decoded;
@@ -322,12 +346,12 @@ class CodexCliService {
       decoded = jsonDecode(trimmed);
     } catch (_) {
       eventTimeline.add('stdout: ${_truncate(trimmed, 180)}');
-      return;
+      return null;
     }
 
     if (decoded is! Map) {
       eventTimeline.add('stdout: ${_truncate(trimmed, 180)}');
-      return;
+      return null;
     }
 
     final type = decoded['type']?.toString() ?? 'unknown';
@@ -335,10 +359,10 @@ class CodexCliService {
       case 'thread.started':
         final threadId = decoded['thread_id']?.toString() ?? 'unknown';
         eventTimeline.add('thread.started id=$threadId');
-        return;
+        return 'Starting Codex thread…';
       case 'turn.started':
         eventTimeline.add('turn.started');
-        return;
+        return 'Thinking…';
       case 'turn.completed':
         final usage = decoded['usage'];
         if (usage is Map) {
@@ -346,13 +370,13 @@ class CodexCliService {
         } else {
           eventTimeline.add('turn.completed');
         }
-        return;
+        return 'Reviewing results…';
       case 'item.started':
       case 'item.completed':
         final item = decoded['item'];
         if (item is! Map) {
           eventTimeline.add(type);
-          return;
+          return null;
         }
 
         final itemType = item['type']?.toString() ?? 'unknown';
@@ -363,7 +387,7 @@ class CodexCliService {
             onCompletionDetected(text);
           }
           eventTimeline.add('$type agent_message chars=${text.length}');
-          return;
+          return 'Drafting response…';
         }
 
         if (itemType == 'command_execution') {
@@ -382,15 +406,22 @@ class CodexCliService {
                 .trim();
             eventTimeline.add('command.output: ${_truncate(singleLine, 180)}');
           }
-          return;
+          return 'Running tool execution…';
         }
 
         eventTimeline.add('$type $itemType');
-        return;
+        return null;
       default:
         eventTimeline.add(type);
-        return;
+        return null;
     }
+  }
+
+  static List<String> _tail(List<String> items, int count) {
+    if (items.length <= count) {
+      return List<String>.unmodifiable(items);
+    }
+    return List<String>.unmodifiable(items.sublist(items.length - count));
   }
 
   static String _formatUsage(Map usage) {

@@ -1,6 +1,7 @@
 import 'dart:convert';
 import 'dart:io';
 
+import '../models/flora_models.dart';
 import 'codex_cli_service.dart';
 
 enum CopilotAuthMode { missing, loggedOut, github, unknown }
@@ -37,30 +38,31 @@ class CopilotCliService {
 
   static Future<CopilotCliStatus> inspectStatus() async {
     try {
-      final directVersion = await Process.run(
-        'copilot',
-        const ['--version'],
-        runInShell: true,
-      );
+      final directVersion = await Process.run('copilot', const [
+        '--version',
+      ], runInShell: true);
       final directText = _combineProcessOutput(directVersion).trim();
       final directLower = directText.toLowerCase();
 
       var installed = directVersion.exitCode == 0;
       var statusText = directText;
 
-      if (!installed || directLower.contains('cannot find github copilot cli')) {
-        final ghProbe = await Process.run(
-          'gh',
-          const ['copilot', '--', '--version'],
-          runInShell: true,
-        );
+      if (!installed ||
+          directLower.contains('cannot find github copilot cli')) {
+        final ghProbe = await Process.run('gh', const [
+          'copilot',
+          '--',
+          '--version',
+        ], runInShell: true);
         final ghText = _combineProcessOutput(ghProbe).trim();
         final ghLower = ghText.toLowerCase();
 
         installed =
             ghProbe.exitCode == 0 &&
             !ghLower.contains('cannot find github copilot cli');
-        statusText = ghText.ifEmpty(statusText.ifEmpty('Copilot CLI not found.'));
+        statusText = ghText.ifEmpty(
+          statusText.ifEmpty('Copilot CLI not found.'),
+        );
       }
 
       if (!installed) {
@@ -73,11 +75,10 @@ class CopilotCliService {
         );
       }
 
-      final auth = await Process.run(
-        'gh',
-        const ['auth', 'status'],
-        runInShell: true,
-      );
+      final auth = await Process.run('gh', const [
+        'auth',
+        'status',
+      ], runInShell: true);
       final authText = _combineProcessOutput(auth).trim();
       final authLower = authText.toLowerCase();
 
@@ -94,14 +95,18 @@ class CopilotCliService {
         return CopilotCliStatus(
           installed: true,
           mode: CopilotAuthMode.loggedOut,
-          message: authText.ifEmpty('Run gh auth login and then copilot login.'),
+          message: authText.ifEmpty(
+            'Run gh auth login and then copilot login.',
+          ),
         );
       }
 
       return CopilotCliStatus(
         installed: true,
         mode: CopilotAuthMode.unknown,
-        message: authText.ifEmpty(statusText.ifEmpty('Copilot CLI is installed.')),
+        message: authText.ifEmpty(
+          statusText.ifEmpty('Copilot CLI is installed.'),
+        ),
       );
     } on ProcessException catch (error) {
       return CopilotCliStatus(
@@ -153,9 +158,12 @@ class CopilotCliService {
     required String workingDirectory,
     String model = 'gpt-5.2',
     String reasoningEffort = 'medium',
+    void Function(AssistantExecutionUpdate update)? onProgress,
   }) async {
     final normalizedModel = model.trim().isEmpty ? 'gpt-5.2' : model.trim();
-    final normalizedReasoningEffort = _normalizeReasoningEffort(reasoningEffort);
+    final normalizedReasoningEffort = _normalizeReasoningEffort(
+      reasoningEffort,
+    );
 
     try {
       final arguments = [
@@ -185,13 +193,29 @@ class CopilotCliService {
       final eventTimeline = <String>[];
       final modelThoughts = <String>[];
       String completionMessage = '';
+      String statusLine = 'Starting Copilot…';
+
+      void emitProgress({String? status, bool isFinal = false}) {
+        if (status != null && status.trim().isNotEmpty) {
+          statusLine = status.trim();
+        }
+
+        onProgress?.call(
+          AssistantExecutionUpdate(
+            status: statusLine,
+            thoughts: _tail(modelThoughts, 4),
+            events: _tail(eventTimeline, 8),
+            isFinal: isFinal,
+          ),
+        );
+      }
 
       final stdoutDone = process.stdout
           .transform(utf8.decoder)
           .transform(const LineSplitter())
           .listen((line) {
             stdoutBuffer.writeln(line);
-            _captureJsonEvent(
+            final progressStatus = _captureJsonEvent(
               line: line,
               eventTimeline: eventTimeline,
               modelThoughts: modelThoughts,
@@ -201,6 +225,7 @@ class CopilotCliService {
                 }
               },
             );
+            emitProgress(status: progressStatus);
           })
           .asFuture<void>();
 
@@ -212,15 +237,19 @@ class CopilotCliService {
             if (line.trim().isNotEmpty) {
               eventTimeline.add('stderr: ${line.trim()}');
             }
+            emitProgress(status: 'Running Copilot…');
           })
           .asFuture<void>();
 
+      emitProgress(status: 'Submitting prompt…');
       final exitCode = await process.exitCode;
       await Future.wait([stdoutDone, stderrDone]);
 
       if (completionMessage.isEmpty && modelThoughts.isNotEmpty) {
         completionMessage = modelThoughts.last;
       }
+
+      emitProgress(status: 'Wrapping up…', isFinal: true);
 
       final resolvedStdout = completionMessage.isNotEmpty
           ? completionMessage
@@ -277,7 +306,7 @@ class CopilotCliService {
     ].join('\n\n');
   }
 
-  static void _captureJsonEvent({
+  static String? _captureJsonEvent({
     required String line,
     required List<String> eventTimeline,
     required List<String> modelThoughts,
@@ -285,7 +314,7 @@ class CopilotCliService {
   }) {
     final trimmed = line.trim();
     if (trimmed.isEmpty) {
-      return;
+      return null;
     }
 
     dynamic decoded;
@@ -293,12 +322,12 @@ class CopilotCliService {
       decoded = jsonDecode(trimmed);
     } catch (_) {
       eventTimeline.add('stdout: ${_truncate(trimmed, 180)}');
-      return;
+      return null;
     }
 
     if (decoded is! Map) {
       eventTimeline.add('stdout: ${_truncate(trimmed, 180)}');
-      return;
+      return null;
     }
 
     final type = decoded['type']?.toString() ?? 'unknown';
@@ -307,17 +336,25 @@ class CopilotCliService {
       if (data is Map) {
         final content = data['content']?.toString() ?? '';
         final phase = data['phase']?.toString() ?? 'unknown';
-        eventTimeline.add('assistant.message phase=$phase chars=${content.length}');
+        eventTimeline.add(
+          'assistant.message phase=$phase chars=${content.length}',
+        );
         if (content.trim().isNotEmpty) {
           modelThoughts.add(content.trim());
           if (phase == 'final_answer') {
             onCompletionDetected(content);
           }
         }
+        return switch (phase) {
+          'analysis' => 'Thinking…',
+          'final_answer' => 'Writing final answer…',
+          'tool_call' => 'Using a tool…',
+          _ => 'Working…',
+        };
       } else {
         eventTimeline.add('assistant.message');
       }
-      return;
+      return 'Working…';
     }
 
     if (type == 'result') {
@@ -331,10 +368,11 @@ class CopilotCliService {
           'usage total_api_ms=$totalApiDuration session_ms=$sessionDuration',
         );
       }
-      return;
+      return 'Finalizing…';
     }
 
     eventTimeline.add(type);
+    return null;
   }
 
   static String _normalizeReasoningEffort(String input) {
@@ -359,6 +397,13 @@ class CopilotCliService {
       return value;
     }
     return '${value.substring(0, maxChars)}...';
+  }
+
+  static List<String> _tail(List<String> items, int count) {
+    if (items.length <= count) {
+      return List<String>.unmodifiable(items);
+    }
+    return List<String>.unmodifiable(items.sublist(items.length - count));
   }
 }
 

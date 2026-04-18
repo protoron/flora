@@ -6,8 +6,8 @@ enum LogLevel { info, warning, error }
 
 enum AssistantProviderType { codex, copilot }
 
-/// Temporary kill switch for Codex while integration work is paused.
-const bool codexIntegrationEnabled = false;
+/// Feature flag for enabling or disabling Codex integration in Flora.
+const bool codexIntegrationEnabled = true;
 
 List<AssistantProviderType> enabledAssistantProviders() {
   if (codexIntegrationEnabled) {
@@ -186,6 +186,20 @@ class InspectorSelectionContext {
   final DateTime capturedAt;
 }
 
+class AssistantExecutionUpdate {
+  const AssistantExecutionUpdate({
+    required this.status,
+    this.thoughts = const [],
+    this.events = const [],
+    this.isFinal = false,
+  });
+
+  final String status;
+  final List<String> thoughts;
+  final List<String> events;
+  final bool isFinal;
+}
+
 class ChatMessage {
   const ChatMessage({
     required this.id,
@@ -199,6 +213,7 @@ class ChatMessage {
     this.thoughts = const [],
     this.completionSummary,
     this.debugLines = const [],
+    this.isStreaming = false,
   });
 
   final String id;
@@ -212,6 +227,37 @@ class ChatMessage {
   final List<String> thoughts;
   final String? completionSummary;
   final List<String> debugLines;
+  final bool isStreaming;
+
+  ChatMessage copyWith({
+    String? id,
+    MessageRole? role,
+    String? content,
+    DateTime? timestamp,
+    InspectorSelectionContext? inspectorAttachment,
+    String? model,
+    String? reasoningEffort,
+    AssistantProviderType? assistantProvider,
+    List<String>? thoughts,
+    String? completionSummary,
+    List<String>? debugLines,
+    bool? isStreaming,
+  }) {
+    return ChatMessage(
+      id: id ?? this.id,
+      role: role ?? this.role,
+      content: content ?? this.content,
+      timestamp: timestamp ?? this.timestamp,
+      inspectorAttachment: inspectorAttachment ?? this.inspectorAttachment,
+      model: model ?? this.model,
+      reasoningEffort: reasoningEffort ?? this.reasoningEffort,
+      assistantProvider: assistantProvider ?? this.assistantProvider,
+      thoughts: thoughts ?? this.thoughts,
+      completionSummary: completionSummary ?? this.completionSummary,
+      debugLines: debugLines ?? this.debugLines,
+      isStreaming: isStreaming ?? this.isStreaming,
+    );
+  }
 }
 
 class RuntimeMetric {
