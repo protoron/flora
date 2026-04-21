@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:io';
 
 import 'package:flutter/material.dart';
@@ -88,16 +89,24 @@ List<ChatMessage> _recentPromptHistory(List<ChatMessage> history) {
     if (message.isStreaming) {
       return false;
     }
-    if (message.role != MessageRole.user) {
+    if (message.role == MessageRole.system) {
       return false;
     }
     return message.content.trim().isNotEmpty;
   }).toList();
 
-  if (resolved.length <= 8) {
+  if (resolved.length <= 6) {
     return resolved;
   }
-  return resolved.sublist(resolved.length - 8);
+  return resolved.sublist(resolved.length - 6);
+}
+
+String _summarizeConversationEntry(String value, {int maxChars = 220}) {
+  final normalized = value.replaceAll(RegExp(r'\s+'), ' ').trim();
+  if (normalized.length <= maxChars) {
+    return normalized;
+  }
+  return '${normalized.substring(0, maxChars)}...';
 }
 
 class _ProviderStatusSnapshot {
@@ -127,24 +136,33 @@ class _ChatWorkspacePaneState extends ConsumerState<ChatWorkspacePane> {
   final _inputCtrl = TextEditingController();
   final _scrollCtrl = ScrollController();
   final _inputFocus = FocusNode();
-  bool _requestInFlight = false;
+  Timer? _pendingScroll;
   String? _lastSubmittedText;
   DateTime? _lastSubmittedAt;
 
   @override
+  void initState() {
+    super.initState();
+    _inputCtrl.text = ref.read(chatComposerTextProvider);
+    _inputCtrl.addListener(_syncComposerDraftFromInput);
+  }
+
+  @override
   void dispose() {
+    _pendingScroll?.cancel();
+    _inputCtrl.removeListener(_syncComposerDraftFromInput);
     _inputCtrl.dispose();
     _scrollCtrl.dispose();
     _inputFocus.dispose();
     super.dispose();
   }
 
-  String? _readFile(String path) {
-    try {
-      return File(path).readAsStringSync();
-    } catch (_) {
-      return null;
+  void _syncComposerDraftFromInput() {
+    final currentDraft = ref.read(chatComposerTextProvider);
+    if (currentDraft == _inputCtrl.text) {
+      return;
     }
+    ref.read(chatComposerTextProvider.notifier).state = _inputCtrl.text;
   }
 
   String? _readFileExcerpt(
@@ -153,40 +171,40 @@ class _ChatWorkspacePaneState extends ConsumerState<ChatWorkspacePane> {
     required int? endLine,
     int contextRadius = 4,
   }) {
-    final raw = _readFile(path);
-    if (raw == null) {
+    try {
+      final raw = File(path).readAsStringSync();
+      final lines = raw.split('\n');
+      if (lines.isEmpty) {
+        return null;
+      }
+
+      final anchorStart = startLine == null || startLine < 1 ? 1 : startLine;
+      final anchorEnd = endLine == null || endLine < anchorStart
+          ? anchorStart
+          : endLine;
+
+      final excerptStart = anchorStart - contextRadius < 1
+          ? 1
+          : anchorStart - contextRadius;
+      final excerptEnd = anchorEnd + contextRadius > lines.length
+          ? lines.length
+          : anchorEnd + contextRadius;
+
+      final excerpt = <String>[];
+      for (
+        var lineNumber = excerptStart;
+        lineNumber <= excerptEnd;
+        lineNumber++
+      ) {
+        excerpt.add(
+          '${lineNumber.toString().padLeft(4)}: ${lines[lineNumber - 1]}',
+        );
+      }
+
+      return excerpt.join('\n').trimRight();
+    } catch (_) {
       return null;
     }
-
-    final lines = raw.split('\n');
-    if (lines.isEmpty) {
-      return null;
-    }
-
-    final anchorStart = startLine == null || startLine < 1 ? 1 : startLine;
-    final anchorEnd = endLine == null || endLine < anchorStart
-        ? anchorStart
-        : endLine;
-
-    final excerptStart = anchorStart - contextRadius < 1
-        ? 1
-        : anchorStart - contextRadius;
-    final excerptEnd = anchorEnd + contextRadius > lines.length
-        ? lines.length
-        : anchorEnd + contextRadius;
-
-    final excerpt = <String>[];
-    for (
-      var lineNumber = excerptStart;
-      lineNumber <= excerptEnd;
-      lineNumber++
-    ) {
-      excerpt.add(
-        '${lineNumber.toString().padLeft(4)}: ${lines[lineNumber - 1]}',
-      );
-    }
-
-    return excerpt.join('\n').trimRight();
   }
 
   Future<_ProviderStatusSnapshot> _inspectProviderStatus(
@@ -249,7 +267,6 @@ class _ChatWorkspacePaneState extends ConsumerState<ChatWorkspacePane> {
       ref.read(activeFilePathProvider),
       projectRoot,
     );
-    final fileContent = activePath == null ? null : _readFile(activePath);
     final inspectorSelection = _projectScopedInspectorSelection(
       ref.read(inspectorSelectionProvider),
       projectRoot,
@@ -315,15 +332,6 @@ class _ChatWorkspacePaneState extends ConsumerState<ChatWorkspacePane> {
       userBuffer
         ..writeln()
         ..writeln('Active file: $activePath');
-      if (fileContent != null) {
-        final snippet = fileContent.split('\n').take(400).join('\n');
-        userBuffer
-          ..writeln()
-          ..writeln('Open file contents:')
-          ..writeln('```')
-          ..writeln(snippet)
-          ..writeln('```');
-      }
     }
 
     if (inspectorSelection != null) {
@@ -382,7 +390,7 @@ class _ChatWorkspacePaneState extends ConsumerState<ChatWorkspacePane> {
         };
         userBuffer
           ..writeln('$role:')
-          ..writeln(message.content.trim())
+          ..writeln(_summarizeConversationEntry(message.content))
           ..writeln();
       }
     }
@@ -405,10 +413,6 @@ class _ChatWorkspacePaneState extends ConsumerState<ChatWorkspacePane> {
       return;
     }
 
-    if (_requestInFlight || ref.read(chatLoadingProvider)) {
-      return;
-    }
-
     final now = DateTime.now();
     final recentDuplicate =
         _lastSubmittedText == text &&
@@ -423,7 +427,6 @@ class _ChatWorkspacePaneState extends ConsumerState<ChatWorkspacePane> {
       return;
     }
 
-    _requestInFlight = true;
     _lastSubmittedText = text;
     _lastSubmittedAt = now;
 
@@ -439,7 +442,10 @@ class _ChatWorkspacePaneState extends ConsumerState<ChatWorkspacePane> {
     final selectedCopilotPermissionMode = ref.read(
       copilotPermissionModeProvider,
     );
-    final inspectorSelection = ref.read(inspectorSelectionProvider);
+    final inspectorSelection = _projectScopedInspectorSelection(
+      ref.read(inspectorSelectionProvider),
+      projectRoot,
+    );
     final statusBeforeFuture = _inspectProviderStatus(selectedAssistant);
     final prompt = _buildPrompt(
       text: text,
@@ -478,8 +484,10 @@ class _ChatWorkspacePaneState extends ConsumerState<ChatWorkspacePane> {
     ref
         .read(chatHistoryProvider.notifier)
         .update((state) => [...state, userMsg, streamingMsg]);
-    ref.read(chatLoadingProvider.notifier).state = true;
-    _scrollToBottom();
+    ref
+        .read(chatActiveRequestCountProvider.notifier)
+        .update((count) => count + 1);
+    _scrollToBottom(force: true);
 
     try {
       final statusBefore = await statusBeforeFuture;
@@ -583,8 +591,11 @@ class _ChatWorkspacePaneState extends ConsumerState<ChatWorkspacePane> {
       );
       _replaceChatMessage(assistantMessageId, (_) => assistantMsg);
 
-      // Trigger hot reload after every completed Codex message.
-      ref.read(hotReloadTriggerProvider.notifier).update((count) => count + 1);
+      if (result.success) {
+        ref
+            .read(hotReloadTriggerProvider.notifier)
+            .update((count) => count + 1);
+      }
     } catch (error) {
       final assistantMsg = ChatMessage(
         id: assistantMessageId,
@@ -603,9 +614,10 @@ class _ChatWorkspacePaneState extends ConsumerState<ChatWorkspacePane> {
       );
       _replaceChatMessage(assistantMessageId, (_) => assistantMsg);
     } finally {
-      _requestInFlight = false;
-      ref.read(chatLoadingProvider.notifier).state = false;
-      _scrollToBottom();
+      ref
+          .read(chatActiveRequestCountProvider.notifier)
+          .update((count) => count > 0 ? count - 1 : 0);
+      _scrollToBottom(force: true);
     }
   }
 
@@ -646,16 +658,34 @@ class _ChatWorkspacePaneState extends ConsumerState<ChatWorkspacePane> {
     _scrollToBottom();
   }
 
-  void _scrollToBottom() {
-    WidgetsBinding.instance.addPostFrameCallback((_) {
-      if (_scrollCtrl.hasClients) {
-        _scrollCtrl.animateTo(
-          _scrollCtrl.position.maxScrollExtent,
-          duration: const Duration(milliseconds: 200),
-          curve: Curves.easeOut,
-        );
-      }
-    });
+  void _scrollToBottom({bool force = false}) {
+    _pendingScroll?.cancel();
+    _pendingScroll = Timer(
+      force ? Duration.zero : const Duration(milliseconds: 70),
+      () {
+        if (!mounted) {
+          return;
+        }
+
+        WidgetsBinding.instance.addPostFrameCallback((_) {
+          if (!_scrollCtrl.hasClients) {
+            return;
+          }
+
+          final position = _scrollCtrl.position;
+          final distanceToBottom = position.maxScrollExtent - position.pixels;
+          if (!force && distanceToBottom > 180) {
+            return;
+          }
+
+          _scrollCtrl.animateTo(
+            position.maxScrollExtent,
+            duration: const Duration(milliseconds: 160),
+            curve: Curves.easeOut,
+          );
+        });
+      },
+    );
   }
 
   int promptHistoryCount(List<ChatMessage> history) {
@@ -672,6 +702,17 @@ class _ChatWorkspacePaneState extends ConsumerState<ChatWorkspacePane> {
 
   @override
   Widget build(BuildContext context) {
+    ref.listen<String>(chatComposerTextProvider, (previous, next) {
+      if (_inputCtrl.text == next) {
+        return;
+      }
+
+      _inputCtrl.value = TextEditingValue(
+        text: next,
+        selection: TextSelection.collapsed(offset: next.length),
+      );
+    });
+
     final selectedAssistant = ref.watch(assistantProvider);
     final usingCodex = selectedAssistant == AssistantProviderType.codex;
     final providerInstalled = usingCodex
@@ -833,6 +874,8 @@ class _ChatBody extends ConsumerWidget {
       inspectorSelection,
       root,
     );
+    final interactionMode = ref.watch(previewInteractionModeProvider);
+    final activeRequestCount = ref.watch(chatActiveRequestCountProvider);
     final selectedAssistant = ref.watch(assistantProvider);
     final usingCodex = selectedAssistant == AssistantProviderType.codex;
     final selectedModel = usingCodex
@@ -883,6 +926,8 @@ class _ChatBody extends ConsumerWidget {
             inspectorLabel: scopedInspectorSelection == null
                 ? null
                 : _formatInspectorSelectionLabel(scopedInspectorSelection),
+            interactionMode: interactionMode,
+            activeRequestCount: activeRequestCount,
             assistantProvider: selectedAssistant,
             model: selectedModel,
             reasoningEffort: selectedReasoningEffort,
@@ -904,7 +949,6 @@ class _ChatBody extends ConsumerWidget {
                 await prefs.setString('copilot_model', newModel);
                 ref.read(copilotModelProvider.notifier).state = newModel;
               }
-              ref.read(chatHistoryProvider.notifier).state = const [];
             },
           ),
         ),
@@ -934,6 +978,8 @@ class _ChatContextFloater extends StatelessWidget {
     required this.projectRoot,
     required this.activeFilePath,
     required this.inspectorLabel,
+    required this.interactionMode,
+    required this.activeRequestCount,
     required this.assistantProvider,
     required this.model,
     required this.reasoningEffort,
@@ -946,6 +992,8 @@ class _ChatContextFloater extends StatelessWidget {
   final String? projectRoot;
   final String? activeFilePath;
   final String? inspectorLabel;
+  final PreviewInteractionMode interactionMode;
+  final int activeRequestCount;
   final AssistantProviderType assistantProvider;
   final String model;
   final String reasoningEffort;
@@ -1074,6 +1122,18 @@ class _ChatContextFloater extends StatelessWidget {
                   text: projectLabel,
                 ),
                 _ContextPill(
+                  icon: interactionMode == PreviewInteractionMode.annotate
+                      ? Icons.ads_click_outlined
+                      : Icons.touch_app_outlined,
+                  text: interactionMode.label,
+                ),
+                if (activeRequestCount > 0)
+                  _ContextPill(
+                    icon: Icons.sync_outlined,
+                    text:
+                        '$activeRequestCount run${activeRequestCount == 1 ? '' : 's'} active',
+                  ),
+                _ContextPill(
                   icon: Icons.insert_drive_file_outlined,
                   text: fileLabel,
                   onClear: onClearActiveFile,
@@ -1164,8 +1224,9 @@ class _EmptyChat extends StatelessWidget {
           ),
           const SizedBox(height: 8),
           const Text(
-            'Ask anything about the selected Flutter project.',
+            'Ask anything about the selected Flutter project. You can keep sending requests while earlier runs finish.',
             style: TextStyle(color: FloraPalette.textDimmed, fontSize: 12),
+            textAlign: TextAlign.center,
           ),
         ],
       ),
@@ -1509,49 +1570,64 @@ class _InputBar extends ConsumerWidget {
 
   @override
   Widget build(BuildContext context, WidgetRef ref) {
-    final loading = ref.watch(chatLoadingProvider);
+    final activeRequests = ref.watch(chatActiveRequestCountProvider);
 
     return Container(
       color: FloraPalette.panelBg,
       padding: const EdgeInsets.fromLTRB(10, 8, 10, 10),
-      child: Row(
+      child: Column(
         crossAxisAlignment: CrossAxisAlignment.end,
         children: [
-          Expanded(
-            child: TextField(
-              controller: ctrl,
-              focusNode: focus,
-              enabled: !loading,
-              maxLines: 5,
-              minLines: 1,
-              style: const TextStyle(
-                color: FloraPalette.textPrimary,
-                fontSize: 13,
-              ),
-              decoration: InputDecoration(
-                hintText: placeholder,
-                contentPadding: EdgeInsets.symmetric(
-                  horizontal: 10,
-                  vertical: 8,
+          if (activeRequests > 0)
+            Padding(
+              padding: const EdgeInsets.only(right: 2, bottom: 6),
+              child: Text(
+                '$activeRequests run${activeRequests == 1 ? '' : 's'} active. Send another request or keep editing the draft.',
+                style: const TextStyle(
+                  color: FloraPalette.textSecondary,
+                  fontSize: 10,
                 ),
               ),
-              onSubmitted: (_) => onSend(),
-              textInputAction: TextInputAction.send,
             ),
-          ),
-          const SizedBox(width: 8),
-          InkWell(
-            onTap: loading ? null : onSend,
-            borderRadius: BorderRadius.circular(2),
-            child: Container(
-              width: 32,
-              height: 32,
-              decoration: BoxDecoration(
-                color: loading ? FloraPalette.border : FloraPalette.accent,
-                borderRadius: BorderRadius.circular(2),
+          Row(
+            crossAxisAlignment: CrossAxisAlignment.end,
+            children: [
+              Expanded(
+                child: TextField(
+                  controller: ctrl,
+                  focusNode: focus,
+                  maxLines: 5,
+                  minLines: 1,
+                  style: const TextStyle(
+                    color: FloraPalette.textPrimary,
+                    fontSize: 13,
+                  ),
+                  decoration: InputDecoration(
+                    hintText: placeholder,
+                    contentPadding: EdgeInsets.symmetric(
+                      horizontal: 10,
+                      vertical: 8,
+                    ),
+                  ),
+                  onSubmitted: (_) => onSend(),
+                  textInputAction: TextInputAction.send,
+                ),
               ),
-              child: const Icon(Icons.send, size: 14, color: Colors.white),
-            ),
+              const SizedBox(width: 8),
+              InkWell(
+                onTap: onSend,
+                borderRadius: BorderRadius.circular(2),
+                child: Container(
+                  width: 32,
+                  height: 32,
+                  decoration: BoxDecoration(
+                    color: FloraPalette.accent,
+                    borderRadius: BorderRadius.circular(2),
+                  ),
+                  child: const Icon(Icons.send, size: 14, color: Colors.white),
+                ),
+              ),
+            ],
           ),
         ],
       ),

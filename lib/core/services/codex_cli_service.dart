@@ -83,7 +83,43 @@ class CodexCliCommandResult {
 class CodexCliService {
   const CodexCliService._();
 
-  static Future<CodexCliStatus> inspectStatus() async {
+  static const Duration _statusCacheTtl = Duration(seconds: 8);
+  static CodexCliStatus? _cachedStatus;
+  static DateTime? _cachedStatusAt;
+  static Future<CodexCliStatus>? _statusProbe;
+
+  static Future<CodexCliStatus> inspectStatus({bool forceRefresh = false}) {
+    final now = DateTime.now();
+    if (!forceRefresh &&
+        _cachedStatus != null &&
+        _cachedStatusAt != null &&
+        now.difference(_cachedStatusAt!) <= _statusCacheTtl) {
+      return Future.value(_cachedStatus!);
+    }
+
+    if (!forceRefresh && _statusProbe != null) {
+      return _statusProbe!;
+    }
+
+    final probe = _inspectStatusUncached();
+    _statusProbe = probe
+        .then((status) {
+          _cachedStatus = status;
+          _cachedStatusAt = DateTime.now();
+          return status;
+        })
+        .whenComplete(() {
+          _statusProbe = null;
+        });
+    return _statusProbe!;
+  }
+
+  static void invalidateStatusCache() {
+    _cachedStatus = null;
+    _cachedStatusAt = null;
+  }
+
+  static Future<CodexCliStatus> _inspectStatusUncached() async {
     try {
       final version = await Process.run('codex', const [
         '--version',
@@ -144,20 +180,30 @@ class CodexCliService {
     }
   }
 
-  static Future<CodexCliCommandResult> install() {
-    return _run('npm', const ['install', '-g', '@openai/codex']);
+  static Future<CodexCliCommandResult> install() async {
+    final result = await _run('npm', const ['install', '-g', '@openai/codex']);
+    if (result.success) {
+      invalidateStatusCache();
+    }
+    return result;
   }
 
-  static Future<CodexCliCommandResult> loginWithChatgpt() {
-    return _run('codex', const ['login']);
+  static Future<CodexCliCommandResult> loginWithChatgpt() async {
+    final result = await _run('codex', const ['login']);
+    invalidateStatusCache();
+    return result;
   }
 
-  static Future<CodexCliCommandResult> loginWithDeviceCode() {
-    return _run('codex', const ['login', '--device-auth']);
+  static Future<CodexCliCommandResult> loginWithDeviceCode() async {
+    final result = await _run('codex', const ['login', '--device-auth']);
+    invalidateStatusCache();
+    return result;
   }
 
-  static Future<CodexCliCommandResult> logout() {
-    return _run('codex', const ['logout']);
+  static Future<CodexCliCommandResult> logout() async {
+    final result = await _run('codex', const ['logout']);
+    invalidateStatusCache();
+    return result;
   }
 
   static Future<CodexCliCommandResult> execPrompt({

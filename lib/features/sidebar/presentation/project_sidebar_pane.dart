@@ -5,12 +5,51 @@ import 'dart:io';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:path/path.dart' as p;
 import 'package:webview_windows/webview_windows.dart';
 
 import '../../../app/theme/flora_theme.dart';
 import '../../../core/models/flora_models.dart';
 import '../../../core/services/flutter_inspector_service.dart';
 import '../../../core/state/flora_providers.dart';
+
+const _annotationPromptTemplates = <PromptTemplate>[
+  PromptTemplate(
+    title: 'Polish',
+    summary: 'Tighten spacing, hierarchy, and responsiveness for the target.',
+    commandHint:
+        'Polish the selected UI target. Improve spacing, alignment, typography, and responsive behavior without changing the underlying feature flow.',
+  ),
+  PromptTemplate(
+    title: 'Layout',
+    summary: 'Adjust structure and sizing around the target widget.',
+    commandHint:
+        'Refine the layout around the selected UI target. Focus on sizing, padding, alignment, and edge cases across narrow and wide desktop widths.',
+  ),
+  PromptTemplate(
+    title: 'Accessibility',
+    summary: 'Improve clarity, hit areas, and accessibility cues.',
+    commandHint:
+        'Improve the selected UI target for accessibility and interaction quality. Review contrast, hit targets, focus affordances, semantics, and state feedback.',
+  ),
+];
+
+enum _AnnotationNodeFilter { layout, controls, text, all }
+
+extension on _AnnotationNodeFilter {
+  String get label {
+    switch (this) {
+      case _AnnotationNodeFilter.layout:
+        return 'Layout';
+      case _AnnotationNodeFilter.controls:
+        return 'Controls';
+      case _AnnotationNodeFilter.text:
+        return 'Text';
+      case _AnnotationNodeFilter.all:
+        return 'All';
+    }
+  }
+}
 
 class ProjectSidebarPane extends ConsumerStatefulWidget {
   const ProjectSidebarPane({super.key});
@@ -20,6 +59,8 @@ class ProjectSidebarPane extends ConsumerStatefulWidget {
 }
 
 class _ProjectSidebarPaneState extends ConsumerState<ProjectSidebarPane> {
+  static const String _annotationTreeGroupName = 'flora_annotation_tree_group';
+
   final WebviewController _appWebview = WebviewController();
   final WebviewController _devToolsWebview = WebviewController();
   final FocusNode _previewFocusNode = FocusNode(
@@ -30,6 +71,7 @@ class _ProjectSidebarPaneState extends ConsumerState<ProjectSidebarPane> {
   final TextEditingController _runCommandCtrl = TextEditingController(
     text: 'flutter run -d web-server --web-hostname 127.0.0.1',
   );
+  final TextEditingController _annotationSearchCtrl = TextEditingController();
 
   Process? _flutterProcess;
   Process? _devToolsProcess;
@@ -37,8 +79,8 @@ class _ProjectSidebarPaneState extends ConsumerState<ProjectSidebarPane> {
   StreamSubscription<String>? _stderrSub;
   StreamSubscription<String>? _devToolsStdoutSub;
   StreamSubscription<String>? _devToolsStderrSub;
-  Timer? _inspectorSyncTimer;
-  bool _inspectorSyncBusy = false;
+  Timer? _hotReloadDebounceTimer;
+  Timer? _annotationRefreshTimer;
 
   bool _appWebviewInitialized = false;
   bool _devToolsWebviewInitialized = false;
@@ -56,9 +98,17 @@ class _ProjectSidebarPaneState extends ConsumerState<ProjectSidebarPane> {
   _PreviewBuildType _selectedBuildType = _PreviewBuildType.web;
   String? _lastProjectRoot;
   bool _showSettings = false;
-  bool _devToolsSelectorEnabled = false;
   bool _ctrlToggleArmed = false;
+  bool _interactionModeBusy = false;
   bool _inspectorDefaultsApplied = false;
+  bool _loadingAnnotationSnapshot = false;
+  bool _loadingSelectionDetails = false;
+  InspectorTreeSnapshot? _annotationSnapshot;
+  InspectorNodeLayoutDetails? _selectedLayoutDetails;
+  Uint8List? _selectedScreenshotBytes;
+  String? _selectedAnnotationStableKey;
+  _AnnotationNodeFilter _annotationFilter = _AnnotationNodeFilter.layout;
+  int _annotationRefreshRequestId = 0;
 
   @override
   void initState() {
@@ -76,7 +126,8 @@ class _ProjectSidebarPaneState extends ConsumerState<ProjectSidebarPane> {
 
     _flutterProcess?.kill();
     _devToolsProcess?.kill();
-    _inspectorSyncTimer?.cancel();
+    _hotReloadDebounceTimer?.cancel();
+    _annotationRefreshTimer?.cancel();
 
     if (_appWebviewInitialized) {
       _appWebview.dispose();
@@ -87,9 +138,17 @@ class _ProjectSidebarPaneState extends ConsumerState<ProjectSidebarPane> {
 
     _urlCtrl.dispose();
     _runCommandCtrl.dispose();
+    _annotationSearchCtrl.dispose();
     _previewFocusNode.dispose();
-    ref.read(inspectorSelectionProvider.notifier).state = null;
     super.dispose();
+  }
+
+  void _clearInspectorContext() {
+    ref.read(inspectorSelectionProvider.notifier).state = null;
+    ref.read(inspectorSelectionHistoryProvider.notifier).state = const [];
+    _selectedAnnotationStableKey = null;
+    _selectedLayoutDetails = null;
+    _selectedScreenshotBytes = null;
   }
 
   Future<void> _loadApp(String url) async {
@@ -111,10 +170,6 @@ class _ProjectSidebarPaneState extends ConsumerState<ProjectSidebarPane> {
 
       await _appWebview.loadUrl(url);
       _appUrl = url;
-
-      if (_vmServiceUrl != null && _devToolsProcess == null) {
-        unawaited(_ensureDevToolsRunning(_vmServiceUrl!));
-      }
 
       if (!mounted) {
         return;
@@ -209,13 +264,23 @@ class _ProjectSidebarPaneState extends ConsumerState<ProjectSidebarPane> {
       _vmServiceUrl = null;
       _devToolsUrl = null;
       _inspectorDefaultsApplied = false;
-      _devToolsSelectorEnabled = false;
       _ctrlToggleArmed = false;
+      _interactionModeBusy = false;
+      _loadingAnnotationSnapshot = false;
+      _loadingSelectionDetails = false;
+      _annotationSnapshot = null;
+      _selectedLayoutDetails = null;
+      _selectedScreenshotBytes = null;
+      _selectedAnnotationStableKey = null;
+      _annotationFilter = _AnnotationNodeFilter.layout;
       _activeTab = _PreviewTab.app;
       _logs
         ..clear()
         ..add(_runCommandCtrl.text);
     });
+    _annotationSearchCtrl.clear();
+    ref.read(previewInteractionModeProvider.notifier).state =
+        PreviewInteractionMode.use;
 
     try {
       final parts = _runCommandCtrl.text.trim().split(RegExp(r'\s+'));
@@ -304,6 +369,17 @@ class _ProjectSidebarPaneState extends ConsumerState<ProjectSidebarPane> {
     }
 
     _lastProjectRoot = nextRoot;
+    _annotationSearchCtrl.clear();
+    ref.read(previewInteractionModeProvider.notifier).state =
+        PreviewInteractionMode.use;
+    _clearInspectorContext();
+    setState(() {
+      _annotationSnapshot = null;
+      _selectedLayoutDetails = null;
+      _selectedScreenshotBytes = null;
+      _selectedAnnotationStableKey = null;
+      _annotationFilter = _AnnotationNodeFilter.layout;
+    });
     _setBuildType(_PreviewBuildType.web);
     if (_runningFlutter) {
       unawaited(_stopFlutterRun());
@@ -415,12 +491,11 @@ class _ProjectSidebarPaneState extends ConsumerState<ProjectSidebarPane> {
         _vmServiceUrl = detectedVmServiceUrl;
         if (changedSession) {
           _inspectorDefaultsApplied = false;
-          _devToolsSelectorEnabled = false;
+          ref.read(previewInteractionModeProvider.notifier).state =
+              PreviewInteractionMode.use;
           _ctrlToggleArmed = false;
         }
-        _status = 'VM service detected. Starting DevTools...';
-        unawaited(_ensureDevToolsRunning(_vmServiceUrl!));
-        _startInspectorSync();
+        _status = 'VM service detected. Preparing Flora screen map...';
         unawaited(_applyInspectorDefaults());
       }
     }
@@ -509,6 +584,17 @@ class _ProjectSidebarPaneState extends ConsumerState<ProjectSidebarPane> {
     }
   }
 
+  void _openDevToolsTab() {
+    setState(() {
+      _activeTab = _PreviewTab.devTools;
+      _status = 'Opening DevTools...';
+    });
+
+    if (_vmServiceUrl != null && _devToolsProcess == null) {
+      unawaited(_ensureDevToolsRunning(_vmServiceUrl!));
+    }
+  }
+
   void _handleDevToolsLine(String rawLine) {
     final line = rawLine.trim();
     if (line.isEmpty || !mounted) {
@@ -573,16 +659,13 @@ class _ProjectSidebarPaneState extends ConsumerState<ProjectSidebarPane> {
       return;
     }
 
-    final inspectorActivated =
-        await FlutterInspectorService.setInspectorSelectionMode(
-          vmServiceUrl: vmServiceUrl,
-          enabled: true,
-        );
-    final selectorConfigured =
-        await FlutterInspectorService.setInspectorSelectionMode(
-          vmServiceUrl: vmServiceUrl,
-          enabled: false,
-        );
+    final projectRoot = ref.read(projectRootProvider);
+    if (projectRoot != null && projectRoot.trim().isNotEmpty) {
+      await FlutterInspectorService.configureProjectRoots(
+        vmServiceUrl: vmServiceUrl,
+        projectRoot: projectRoot,
+      );
+    }
 
     if (!mounted) {
       return;
@@ -590,41 +673,386 @@ class _ProjectSidebarPaneState extends ConsumerState<ProjectSidebarPane> {
 
     setState(() {
       _inspectorDefaultsApplied = true;
-      _devToolsSelectorEnabled = false;
-      _status = (inspectorActivated || selectorConfigured)
-          ? 'Inspector ready. Selector OFF (press Ctrl to toggle).'
-          : 'Inspector ready. Press Ctrl to toggle selector mode.';
+      _interactionModeBusy = false;
+      _status =
+          'Preview ready. Switch to Annotate UI to browse Flora\'s screen map.';
     });
+
+    if (ref.read(previewInteractionModeProvider) ==
+        PreviewInteractionMode.annotate) {
+      unawaited(
+        _refreshAnnotationSnapshot(
+          preserveSelection: true,
+          statusOverride: 'Refreshing the current screen map...',
+        ),
+      );
+    }
     _requestPreviewFocus();
   }
 
-  Future<void> _toggleDevToolsSelector() async {
-    final vmServiceUrl = _vmServiceUrl;
-    if (!_runningFlutter || vmServiceUrl == null) {
+  Future<void> _setPreviewInteractionMode(PreviewInteractionMode mode) async {
+    final currentMode = ref.read(previewInteractionModeProvider);
+    if (_interactionModeBusy || currentMode == mode) {
       return;
     }
 
-    final nextEnabled = !_devToolsSelectorEnabled;
-    final toggled = await FlutterInspectorService.setInspectorSelectionMode(
-      vmServiceUrl: vmServiceUrl,
-      enabled: nextEnabled,
-    );
+    final vmServiceUrl = _vmServiceUrl;
+    ref.read(previewInteractionModeProvider.notifier).state = mode;
+
+    if (!_runningFlutter || vmServiceUrl == null) {
+      setState(() {
+        _status = mode == PreviewInteractionMode.annotate
+            ? 'Annotate UI will open once the preview is connected.'
+            : 'Use App mode ready.';
+      });
+      return;
+    }
+
+    setState(() {
+      _interactionModeBusy = true;
+      _activeTab = _PreviewTab.app;
+      _status = mode == PreviewInteractionMode.annotate
+          ? 'Building Flora screen map...'
+          : 'Returning to Use App mode...';
+    });
 
     if (!mounted) {
       return;
     }
 
+    if (mode == PreviewInteractionMode.annotate) {
+      await _refreshAnnotationSnapshot(
+        preserveSelection: true,
+        statusOverride: 'Building Flora screen map...',
+      );
+    }
+
     setState(() {
-      if (!toggled) {
-        _status = 'Selector toggle is unavailable for this app session.';
+      _interactionModeBusy = false;
+      _status = mode == PreviewInteractionMode.annotate
+          ? (_annotationSnapshot == null
+                ? 'Annotate UI ready. Refresh once the current screen settles.'
+                : 'Annotate UI ready. Browse the screen map below.')
+          : 'Use App mode on. Your selected target stays attached until you clear it.';
+    });
+    _requestPreviewFocus();
+  }
+
+  Future<void> _togglePreviewInteractionMode() {
+    final currentMode = ref.read(previewInteractionModeProvider);
+    return _setPreviewInteractionMode(
+      currentMode == PreviewInteractionMode.annotate
+          ? PreviewInteractionMode.use
+          : PreviewInteractionMode.annotate,
+    );
+  }
+
+  Future<void> _refreshAnnotationSnapshot({
+    required bool preserveSelection,
+    String? statusOverride,
+  }) async {
+    final vmServiceUrl = _vmServiceUrl;
+    final projectRoot = ref.read(projectRootProvider);
+    if (vmServiceUrl == null ||
+        projectRoot == null ||
+        projectRoot.trim().isEmpty) {
+      return;
+    }
+
+    final requestId = ++_annotationRefreshRequestId;
+    setState(() {
+      _loadingAnnotationSnapshot = true;
+      if (statusOverride != null) {
+        _status = statusOverride;
+      }
+    });
+
+    try {
+      final snapshot = await FlutterInspectorService.fetchAnnotationSnapshot(
+        vmServiceUrl: vmServiceUrl,
+        projectRoot: projectRoot,
+        groupName: _annotationTreeGroupName,
+      );
+      if (!mounted || requestId != _annotationRefreshRequestId) {
         return;
       }
 
-      _devToolsSelectorEnabled = nextEnabled;
-      _status = _devToolsSelectorEnabled
-          ? 'DevTools selector ON (press Ctrl to toggle).'
-          : 'DevTools selector OFF (press Ctrl to toggle).';
+      InspectorTreeNode? nextSelected;
+      if (snapshot != null && preserveSelection) {
+        nextSelected = _resolveAnnotationSelection(snapshot);
+      }
+      nextSelected ??= _firstSuggestedNode(snapshot?.rootNodes ?? const []);
+
+      setState(() {
+        _annotationSnapshot = snapshot;
+        _loadingAnnotationSnapshot = false;
+        _status = snapshot == null
+            ? 'The screen map is not available yet. Let the current frame settle and refresh again.'
+            : 'Screen map refreshed. ${snapshot.layoutNodeCount} layout nodes across ${snapshot.totalNodeCount} captured nodes.';
+      });
+
+      if (snapshot == null) {
+        return;
+      }
+
+      if (nextSelected != null) {
+        await _selectAnnotationNode(nextSelected, fromRefresh: true);
+      }
+    } catch (_) {
+      if (!mounted || requestId != _annotationRefreshRequestId) {
+        return;
+      }
+
+      setState(() {
+        _loadingAnnotationSnapshot = false;
+        _status = 'Failed to refresh Flora\'s screen map.';
+      });
+    }
+  }
+
+  InspectorTreeNode? _resolveAnnotationSelection(
+    InspectorTreeSnapshot snapshot,
+  ) {
+    final stableKey = _selectedAnnotationStableKey;
+    if (stableKey != null) {
+      final match = _findAnnotationNodeByStableKey(
+        snapshot.rootNodes,
+        stableKey,
+      );
+      if (match != null) {
+        return match;
+      }
+    }
+
+    final currentSelection = ref.read(inspectorSelectionProvider);
+    if (currentSelection == null) {
+      return null;
+    }
+
+    return _findAnnotationNodeMatchingSelection(
+      snapshot.rootNodes,
+      currentSelection,
+    );
+  }
+
+  InspectorTreeNode? _firstSuggestedNode(List<InspectorTreeNode> roots) {
+    InspectorTreeNode? fallback;
+
+    InspectorTreeNode? walk(InspectorTreeNode node) {
+      fallback ??= node;
+      if (_matchesAnnotationFilter(node, _AnnotationNodeFilter.layout)) {
+        return node;
+      }
+      for (final child in node.children) {
+        final match = walk(child);
+        if (match != null) {
+          return match;
+        }
+      }
+      return null;
+    }
+
+    for (final root in roots) {
+      final match = walk(root);
+      if (match != null) {
+        return match;
+      }
+    }
+
+    return fallback;
+  }
+
+  InspectorTreeNode? _findAnnotationNodeByStableKey(
+    List<InspectorTreeNode> nodes,
+    String stableKey,
+  ) {
+    for (final node in nodes) {
+      if (node.stableKey == stableKey) {
+        return node;
+      }
+      final child = _findAnnotationNodeByStableKey(node.children, stableKey);
+      if (child != null) {
+        return child;
+      }
+    }
+    return null;
+  }
+
+  InspectorTreeNode? _findAnnotationNodeMatchingSelection(
+    List<InspectorTreeNode> nodes,
+    InspectorSelectionContext selection,
+  ) {
+    for (final node in nodes) {
+      if (_annotationNodeMatchesSelection(node, selection)) {
+        return node;
+      }
+      final child = _findAnnotationNodeMatchingSelection(
+        node.children,
+        selection,
+      );
+      if (child != null) {
+        return child;
+      }
+    }
+    return null;
+  }
+
+  bool _annotationNodeMatchesSelection(
+    InspectorTreeNode node,
+    InspectorSelectionContext selection,
+  ) {
+    return node.widgetName == selection.widgetName &&
+        node.sourceFile == selection.sourceFile &&
+        node.line == selection.line &&
+        node.endLine == selection.endLine &&
+        node.column == selection.column;
+  }
+
+  bool _matchesAnnotationFilter(
+    InspectorTreeNode node,
+    _AnnotationNodeFilter filter,
+  ) {
+    final name = node.widgetName.toLowerCase();
+    switch (filter) {
+      case _AnnotationNodeFilter.layout:
+        return _matchesAnnotationKeyword(name, const <String>{
+          'scaffold',
+          'container',
+          'column',
+          'row',
+          'stack',
+          'padding',
+          'align',
+          'center',
+          'sizedbox',
+          'flex',
+          'expanded',
+          'flexible',
+          'wrap',
+          'listview',
+          'gridview',
+          'scrollview',
+          'sliver',
+          'positioned',
+          'safearea',
+          'card',
+          'decoratedbox',
+          'coloredbox',
+          'clip',
+          'constrainedbox',
+          'fractionallysizedbox',
+          'aspectratio',
+        });
+      case _AnnotationNodeFilter.controls:
+        return _matchesAnnotationKeyword(name, const <String>{
+          'button',
+          'textfield',
+          'textformfield',
+          'switch',
+          'checkbox',
+          'radio',
+          'slider',
+          'dropdown',
+          'popupmenu',
+          'gesture',
+          'inkwell',
+          'listtile',
+          'tabbar',
+          'segmentedbutton',
+          'floatingactionbutton',
+          'iconbutton',
+        });
+      case _AnnotationNodeFilter.text:
+        return _matchesAnnotationKeyword(name, const <String>{
+          'text',
+          'richtext',
+          'selectabletext',
+          'editabletext',
+        });
+      case _AnnotationNodeFilter.all:
+        return true;
+    }
+  }
+
+  bool _matchesAnnotationKeyword(String value, Set<String> fragments) {
+    return fragments.any(value.contains);
+  }
+
+  Future<void> _selectAnnotationNode(
+    InspectorTreeNode node, {
+    bool fromRefresh = false,
+  }) async {
+    _selectedAnnotationStableKey = node.stableKey;
+    final selection = node.toSelectionContext();
+    ref.read(inspectorSelectionProvider.notifier).state = selection;
+    _rememberInspectorSelection(selection);
+    if (node.sourceFile != null && node.sourceFile!.trim().isNotEmpty) {
+      ref.read(activeFilePathProvider.notifier).state = node.sourceFile;
+    }
+
+    setState(() {
+      _loadingSelectionDetails = true;
+      if (!fromRefresh) {
+        _status = 'Inspecting ${node.widgetName}...';
+      }
     });
+
+    final snapshot = _annotationSnapshot;
+    final vmServiceUrl = _vmServiceUrl;
+    if (snapshot == null || vmServiceUrl == null || node.valueId == null) {
+      setState(() {
+        _loadingSelectionDetails = false;
+        _selectedLayoutDetails = null;
+        _selectedScreenshotBytes = null;
+        _status = 'Selected ${node.widgetName} from the screen map.';
+      });
+      return;
+    }
+
+    final stableKey = node.stableKey;
+    try {
+      await FlutterInspectorService.setSelectionById(
+        vmServiceUrl: vmServiceUrl,
+        valueId: node.valueId!,
+        groupName: snapshot.groupName,
+      );
+      final results = await Future.wait<Object?>(<Future<Object?>>[
+        FlutterInspectorService.fetchLayoutDetails(
+          vmServiceUrl: vmServiceUrl,
+          valueId: node.valueId!,
+          groupName: snapshot.groupName,
+        ),
+        FlutterInspectorService.screenshotNode(
+          vmServiceUrl: vmServiceUrl,
+          valueId: node.valueId!,
+        ),
+      ]);
+
+      if (!mounted || _selectedAnnotationStableKey != stableKey) {
+        return;
+      }
+
+      setState(() {
+        _loadingSelectionDetails = false;
+        _selectedLayoutDetails = results[0] as InspectorNodeLayoutDetails?;
+        _selectedScreenshotBytes = results[1] as Uint8List?;
+        _status = fromRefresh
+            ? 'Screen map refreshed around ${node.widgetName}.'
+            : 'Selected ${node.widgetName} from the screen map.';
+      });
+    } catch (_) {
+      if (!mounted || _selectedAnnotationStableKey != stableKey) {
+        return;
+      }
+
+      setState(() {
+        _loadingSelectionDetails = false;
+        _selectedLayoutDetails = null;
+        _selectedScreenshotBytes = null;
+        _status =
+            'Selected ${node.widgetName}, but detailed layout metadata could not be loaded.';
+      });
+    }
   }
 
   KeyEventResult _onPreviewKeyEvent(FocusNode node, KeyEvent event) {
@@ -645,7 +1073,7 @@ class _ProjectSidebarPaneState extends ConsumerState<ProjectSidebarPane> {
         return KeyEventResult.handled;
       }
       _ctrlToggleArmed = true;
-      unawaited(_toggleDevToolsSelector());
+      unawaited(_togglePreviewInteractionMode());
       return KeyEventResult.handled;
     }
 
@@ -657,43 +1085,80 @@ class _ProjectSidebarPaneState extends ConsumerState<ProjectSidebarPane> {
     return KeyEventResult.handled;
   }
 
-  void _startInspectorSync() {
-    if (_inspectorSyncTimer != null) {
-      return;
-    }
-
-    _inspectorSyncTimer = Timer.periodic(
-      const Duration(milliseconds: 1200),
-      (_) => unawaited(_pollInspectorSelection()),
-    );
-    unawaited(_pollInspectorSelection());
+  void _rememberInspectorSelection(InspectorSelectionContext selection) {
+    final history = ref.read(inspectorSelectionHistoryProvider);
+    final nextHistory = <InspectorSelectionContext>[
+      selection,
+      ...history.where((entry) => !_sameInspectorSelection(entry, selection)),
+    ];
+    ref.read(inspectorSelectionHistoryProvider.notifier).state = nextHistory
+        .take(6)
+        .toList(growable: false);
   }
 
-  Future<void> _pollInspectorSelection() async {
-    final vmServiceUrl = _vmServiceUrl;
-    if (_inspectorSyncBusy || vmServiceUrl == null || !mounted) {
+  void _focusSelectionSource(InspectorSelectionContext selection) {
+    final sourceFile = selection.sourceFile;
+    if (sourceFile == null || sourceFile.trim().isEmpty) {
       return;
     }
 
-    _inspectorSyncBusy = true;
-    try {
-      final selection =
-          await FlutterInspectorService.fetchSelectedSummaryWidget(
-            vmServiceUrl: vmServiceUrl,
-          );
-      if (!mounted || selection == null) {
-        return;
-      }
+    ref.read(activeFilePathProvider.notifier).state = sourceFile;
+    setState(() {
+      _status =
+          'Focused ${p.basename(sourceFile)} from the selected UI target.';
+    });
+  }
 
-      final current = ref.read(inspectorSelectionProvider);
-      if (_sameInspectorSelection(current, selection)) {
-        return;
-      }
+  void _queueAnnotationPrompt(
+    PromptTemplate template,
+    InspectorSelectionContext selection,
+  ) {
+    final sourceLabel = selection.sourceFile == null
+        ? selection.widgetName
+        : '${selection.widgetName} in ${p.basename(selection.sourceFile!)}';
+    final prompt = StringBuffer()
+      ..writeln(template.commandHint)
+      ..writeln('Focus on the currently selected widget: $sourceLabel.')
+      ..writeln(
+        'Keep the work scoped to this target unless a nearby structural adjustment is clearly required.',
+      );
 
-      ref.read(inspectorSelectionProvider.notifier).state = selection;
-    } finally {
-      _inspectorSyncBusy = false;
+    final existingDraft = ref.read(chatComposerTextProvider).trim();
+    final nextDraft = existingDraft.isEmpty
+        ? prompt.toString().trim()
+        : '$existingDraft\n\n${prompt.toString().trim()}';
+
+    ref.read(chatComposerTextProvider.notifier).state = nextDraft;
+    _focusSelectionSource(selection);
+    setState(() {
+      _status =
+          'Drafted a ${template.title.toLowerCase()} request for ${selection.widgetName}.';
+    });
+  }
+
+  void _selectInspectorTarget(InspectorSelectionContext selection) {
+    ref.read(inspectorSelectionProvider.notifier).state = selection;
+    _rememberInspectorSelection(selection);
+    if (selection.sourceFile != null &&
+        selection.sourceFile!.trim().isNotEmpty) {
+      ref.read(activeFilePathProvider.notifier).state = selection.sourceFile;
     }
+
+    final snapshot = _annotationSnapshot;
+    if (snapshot != null) {
+      final node = _findAnnotationNodeMatchingSelection(
+        snapshot.rootNodes,
+        selection,
+      );
+      if (node != null) {
+        unawaited(_selectAnnotationNode(node));
+        return;
+      }
+    }
+
+    setState(() {
+      _status = 'Selected ${selection.widgetName} for follow-up changes.';
+    });
   }
 
   bool _sameInspectorSelection(
@@ -704,8 +1169,7 @@ class _ProjectSidebarPaneState extends ConsumerState<ProjectSidebarPane> {
       return false;
     }
 
-    return a.valueId == b.valueId &&
-        a.sourceFile == b.sourceFile &&
+    return a.sourceFile == b.sourceFile &&
         a.line == b.line &&
         a.endLine == b.endLine &&
         a.column == b.column &&
@@ -713,13 +1177,18 @@ class _ProjectSidebarPaneState extends ConsumerState<ProjectSidebarPane> {
   }
 
   void _stopInspectorSync() {
-    _inspectorSyncTimer?.cancel();
-    _inspectorSyncTimer = null;
-    _inspectorSyncBusy = false;
+    _annotationRefreshTimer?.cancel();
     _inspectorDefaultsApplied = false;
-    _devToolsSelectorEnabled = false;
+    _interactionModeBusy = false;
     _ctrlToggleArmed = false;
-    ref.read(inspectorSelectionProvider.notifier).state = null;
+    _loadingAnnotationSnapshot = false;
+    _loadingSelectionDetails = false;
+    _annotationSnapshot = null;
+    _selectedLayoutDetails = null;
+    _selectedScreenshotBytes = null;
+    _selectedAnnotationStableKey = null;
+    ref.read(previewInteractionModeProvider.notifier).state =
+        PreviewInteractionMode.use;
   }
 
   Future<void> _stopFlutterRun() async {
@@ -747,7 +1216,16 @@ class _ProjectSidebarPaneState extends ConsumerState<ProjectSidebarPane> {
     _devToolsStderrSub = null;
     _flutterProcess = null;
     _devToolsProcess = null;
+    final vmServiceUrl = _vmServiceUrl;
     _vmServiceUrl = null;
+    if (vmServiceUrl != null) {
+      unawaited(
+        FlutterInspectorService.disposeGroup(
+          vmServiceUrl: vmServiceUrl,
+          groupName: _annotationTreeGroupName,
+        ),
+      );
+    }
     _stopInspectorSync();
 
     if (!mounted) {
@@ -763,7 +1241,24 @@ class _ProjectSidebarPaneState extends ConsumerState<ProjectSidebarPane> {
   Widget build(BuildContext context) {
     ref.listen(hotReloadTriggerProvider, (previous, next) {
       if (next > (previous ?? 0)) {
-        _sendFlutterCommand('r');
+        _hotReloadDebounceTimer?.cancel();
+        _hotReloadDebounceTimer = Timer(const Duration(milliseconds: 500), () {
+          _sendFlutterCommand('r');
+          _annotationRefreshTimer?.cancel();
+          if (ref.read(previewInteractionModeProvider) ==
+              PreviewInteractionMode.annotate) {
+            _annotationRefreshTimer = Timer(
+              const Duration(milliseconds: 1100),
+              () => unawaited(
+                _refreshAnnotationSnapshot(
+                  preserveSelection: true,
+                  statusOverride:
+                      'Refreshing the screen map after hot reload...',
+                ),
+              ),
+            );
+          }
+        });
       }
     });
     ref.listen<String?>(projectRootProvider, (previous, next) {
@@ -773,6 +1268,16 @@ class _ProjectSidebarPaneState extends ConsumerState<ProjectSidebarPane> {
     final hasProjectRoot = (ref.watch(projectRootProvider) ?? '')
         .trim()
         .isNotEmpty;
+    final interactionMode = ref.watch(previewInteractionModeProvider);
+    final inspectorSelection = ref.watch(inspectorSelectionProvider);
+    final inspectorHistory = ref.watch(inspectorSelectionHistoryProvider);
+    final selectedAnnotationNode =
+        _annotationSnapshot == null || _selectedAnnotationStableKey == null
+        ? null
+        : _findAnnotationNodeByStableKey(
+            _annotationSnapshot!.rootNodes,
+            _selectedAnnotationStableKey!,
+          );
 
     return Focus(
       focusNode: _previewFocusNode,
@@ -809,9 +1314,9 @@ class _ProjectSidebarPaneState extends ConsumerState<ProjectSidebarPane> {
                     if (_runningFlutter) ...[
                       const SizedBox(width: 8),
                       Text(
-                        _devToolsSelectorEnabled
-                            ? 'selector:on'
-                            : 'selector:off',
+                        interactionMode == PreviewInteractionMode.annotate
+                            ? 'mode:annotate-ui'
+                            : 'mode:use-app',
                         style: FloraTheme.mono(
                           size: 10,
                           color: FloraPalette.textDimmed,
@@ -860,16 +1365,11 @@ class _ProjectSidebarPaneState extends ConsumerState<ProjectSidebarPane> {
                             tooltip: 'Hot Restart',
                           ),
                         ),
-                        InkWell(
-                          onTap: _toggleDevToolsSelector,
-                          child: _ToolbarIcon(
-                            _devToolsSelectorEnabled
-                                ? Icons.ads_click
-                                : Icons.ads_click_outlined,
-                            tooltip: _devToolsSelectorEnabled
-                                ? 'Disable selector (Ctrl)'
-                                : 'Enable selector (Ctrl)',
-                          ),
+                        const SizedBox(width: 8),
+                        _InteractionModeToggle(
+                          mode: interactionMode,
+                          busy: _interactionModeBusy,
+                          onChanged: _setPreviewInteractionMode,
                         ),
                       ],
                     ],
@@ -1003,6 +1503,54 @@ class _ProjectSidebarPaneState extends ConsumerState<ProjectSidebarPane> {
                   ),
                 ),
 
+              if (_runningFlutter)
+                _AnnotationWorkbench(
+                  mode: interactionMode,
+                  snapshot: _annotationSnapshot,
+                  selection: inspectorSelection,
+                  selectedNode: selectedAnnotationNode,
+                  selectedLayoutDetails: _selectedLayoutDetails,
+                  selectedScreenshotBytes: _selectedScreenshotBytes,
+                  history: inspectorHistory,
+                  busy: _interactionModeBusy,
+                  loadingSnapshot: _loadingAnnotationSnapshot,
+                  loadingSelectionDetails: _loadingSelectionDetails,
+                  annotationFilter: _annotationFilter,
+                  searchController: _annotationSearchCtrl,
+                  onModeChanged: _setPreviewInteractionMode,
+                  onRefresh: () => _refreshAnnotationSnapshot(
+                    preserveSelection: true,
+                    statusOverride: 'Refreshing the current screen map...',
+                  ),
+                  onSearchChanged: (_) => setState(() {}),
+                  onFilterChanged: (nextFilter) => setState(() {
+                    _annotationFilter = nextFilter;
+                  }),
+                  onSelectNode: _selectAnnotationNode,
+                  onFocusSource: inspectorSelection == null
+                      ? null
+                      : () => _focusSelectionSource(inspectorSelection),
+                  onClearSelection: inspectorSelection == null
+                      ? null
+                      : () {
+                          ref.read(inspectorSelectionProvider.notifier).state =
+                              null;
+                          setState(() {
+                            _selectedAnnotationStableKey = null;
+                            _selectedLayoutDetails = null;
+                            _selectedScreenshotBytes = null;
+                            _status = 'Cleared the current UI target.';
+                          });
+                        },
+                  onQueuePrompt: inspectorSelection == null
+                      ? null
+                      : (template) => _queueAnnotationPrompt(
+                          template,
+                          inspectorSelection,
+                        ),
+                  onSelectHistory: _selectInspectorTarget,
+                ),
+
               Expanded(child: _buildBody()),
             ],
           ),
@@ -1063,7 +1611,7 @@ class _ProjectSidebarPaneState extends ConsumerState<ProjectSidebarPane> {
         icon: Icons.bug_report_outlined,
         title: 'No DevTools session',
         subtitle:
-            'Run & Load first, then open DevTools for Inspector and widget debug toggles.',
+            'Run & Load first, then open DevTools only when you need the raw Flutter inspector tools.',
         logs: _logs,
       );
     }
@@ -1085,7 +1633,7 @@ class _ProjectSidebarPaneState extends ConsumerState<ProjectSidebarPane> {
               _TabChip(
                 label: 'DevTools',
                 active: _activeTab == _PreviewTab.devTools,
-                onTap: () => setState(() => _activeTab = _PreviewTab.devTools),
+                onTap: _openDevToolsTab,
               ),
               const Spacer(),
               if (_activeTab == _PreviewTab.app && _appUrl != null)
@@ -1280,6 +1828,1046 @@ class _TinyButton extends StatelessWidget {
             fontSize: 11,
             fontWeight: FontWeight.w600,
           ),
+        ),
+      ),
+    );
+  }
+}
+
+class _InteractionModeToggle extends StatelessWidget {
+  const _InteractionModeToggle({
+    required this.mode,
+    required this.busy,
+    required this.onChanged,
+  });
+
+  final PreviewInteractionMode mode;
+  final bool busy;
+  final ValueChanged<PreviewInteractionMode> onChanged;
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      padding: const EdgeInsets.all(2),
+      decoration: BoxDecoration(
+        color: FloraPalette.background,
+        border: Border.all(color: FloraPalette.border),
+        borderRadius: BorderRadius.circular(6),
+      ),
+      child: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: PreviewInteractionMode.values
+            .map((entry) {
+              final active = entry == mode;
+              return InkWell(
+                onTap: busy ? null : () => onChanged(entry),
+                borderRadius: BorderRadius.circular(4),
+                child: Container(
+                  padding: const EdgeInsets.symmetric(
+                    horizontal: 8,
+                    vertical: 5,
+                  ),
+                  decoration: BoxDecoration(
+                    color: active ? FloraPalette.accent : Colors.transparent,
+                    borderRadius: BorderRadius.circular(4),
+                  ),
+                  child: Text(
+                    entry.label,
+                    style: TextStyle(
+                      color: active ? Colors.white : FloraPalette.textSecondary,
+                      fontSize: 10,
+                      fontWeight: FontWeight.w600,
+                    ),
+                  ),
+                ),
+              );
+            })
+            .toList(growable: false),
+      ),
+    );
+  }
+}
+
+class _AnnotationWorkbench extends StatelessWidget {
+  const _AnnotationWorkbench({
+    required this.mode,
+    required this.snapshot,
+    required this.selection,
+    required this.selectedNode,
+    required this.selectedLayoutDetails,
+    required this.selectedScreenshotBytes,
+    required this.history,
+    required this.busy,
+    required this.loadingSnapshot,
+    required this.loadingSelectionDetails,
+    required this.annotationFilter,
+    required this.searchController,
+    required this.onModeChanged,
+    required this.onRefresh,
+    required this.onSearchChanged,
+    required this.onFilterChanged,
+    required this.onSelectNode,
+    required this.onFocusSource,
+    required this.onClearSelection,
+    required this.onQueuePrompt,
+    required this.onSelectHistory,
+  });
+
+  final PreviewInteractionMode mode;
+  final InspectorTreeSnapshot? snapshot;
+  final InspectorSelectionContext? selection;
+  final InspectorTreeNode? selectedNode;
+  final InspectorNodeLayoutDetails? selectedLayoutDetails;
+  final Uint8List? selectedScreenshotBytes;
+  final List<InspectorSelectionContext> history;
+  final bool busy;
+  final bool loadingSnapshot;
+  final bool loadingSelectionDetails;
+  final _AnnotationNodeFilter annotationFilter;
+  final TextEditingController searchController;
+  final ValueChanged<PreviewInteractionMode> onModeChanged;
+  final Future<void> Function() onRefresh;
+  final ValueChanged<String> onSearchChanged;
+  final ValueChanged<_AnnotationNodeFilter> onFilterChanged;
+  final ValueChanged<InspectorTreeNode> onSelectNode;
+  final VoidCallback? onFocusSource;
+  final VoidCallback? onClearSelection;
+  final ValueChanged<PromptTemplate>? onQueuePrompt;
+  final ValueChanged<InspectorSelectionContext> onSelectHistory;
+
+  @override
+  Widget build(BuildContext context) {
+    final recentTargets = history
+        .where((entry) => !_sameSelection(entry, selection))
+        .take(4)
+        .toList(growable: false);
+    final locationLabel = _selectionLocation(selection);
+    final ancestryLabel = selection == null || selection!.ancestorPath.isEmpty
+        ? null
+        : selection!.ancestorPath.reversed.take(6).join(' > ');
+    final query = searchController.text.trim().toLowerCase();
+    final visibleNodes = snapshot == null
+        ? const <_VisibleAnnotationNode>[]
+        : snapshot!.rootNodes
+              .expand(
+                (node) => _visibleEntriesFor(
+                  node,
+                  query: query,
+                  filter: annotationFilter,
+                ),
+              )
+              .toList(growable: false);
+
+    return Container(
+      color: FloraPalette.sidebarBg,
+      padding: const EdgeInsets.fromLTRB(10, 10, 10, 10),
+      child: Container(
+        padding: const EdgeInsets.all(10),
+        decoration: BoxDecoration(
+          color: FloraPalette.panelBg,
+          border: Border.all(color: FloraPalette.border),
+          borderRadius: BorderRadius.circular(10),
+        ),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Row(
+              children: [
+                const Icon(
+                  Icons.design_services_outlined,
+                  size: 14,
+                  color: FloraPalette.textSecondary,
+                ),
+                const SizedBox(width: 6),
+                const Text(
+                  'Flora Screen Map',
+                  style: TextStyle(
+                    color: FloraPalette.textPrimary,
+                    fontSize: 11,
+                    fontWeight: FontWeight.w700,
+                  ),
+                ),
+                const Spacer(),
+                _TinyButton(
+                  label: loadingSnapshot ? 'Refreshing...' : 'Refresh Map',
+                  onTap: busy || loadingSnapshot
+                      ? null
+                      : () => unawaited(onRefresh()),
+                ),
+                const SizedBox(width: 8),
+                _InteractionModeToggle(
+                  mode: mode,
+                  busy: busy,
+                  onChanged: onModeChanged,
+                ),
+              ],
+            ),
+            const SizedBox(height: 8),
+            Text(
+              mode == PreviewInteractionMode.annotate
+                  ? 'Browse the current widget structure without freezing the live preview. Search by widget, source file, or text, then target the right container directly.'
+                  : selection == null
+                  ? mode.helperText
+                  : 'Your current target stays attached while you use the app. Switch back to Annotate UI when you want to retarget or inspect structure again.',
+              style: const TextStyle(
+                color: FloraPalette.textSecondary,
+                fontSize: 11,
+                height: 1.4,
+              ),
+            ),
+            if (snapshot != null) ...[
+              const SizedBox(height: 8),
+              Wrap(
+                spacing: 6,
+                runSpacing: 6,
+                children: [
+                  _SelectionInfoChip(
+                    icon: Icons.view_quilt_outlined,
+                    text: '${snapshot!.layoutNodeCount} layout',
+                  ),
+                  _SelectionInfoChip(
+                    icon: Icons.smart_button_outlined,
+                    text: '${snapshot!.controlNodeCount} controls',
+                  ),
+                  _SelectionInfoChip(
+                    icon: Icons.text_fields,
+                    text: '${snapshot!.textNodeCount} text',
+                  ),
+                  _SelectionInfoChip(
+                    icon: Icons.widgets_outlined,
+                    text: '${snapshot!.totalNodeCount} total',
+                  ),
+                ],
+              ),
+            ],
+            const SizedBox(height: 10),
+            if (mode == PreviewInteractionMode.annotate) ...[
+              Row(
+                children: [
+                  Expanded(
+                    child: TextField(
+                      controller: searchController,
+                      onChanged: onSearchChanged,
+                      style: FloraTheme.mono(size: 11),
+                      decoration: const InputDecoration(
+                        hintText: 'Search widget, source file, or text preview',
+                        isDense: true,
+                        contentPadding: EdgeInsets.symmetric(
+                          horizontal: 8,
+                          vertical: 8,
+                        ),
+                        prefixIcon: Icon(
+                          Icons.search,
+                          size: 16,
+                          color: FloraPalette.textDimmed,
+                        ),
+                      ),
+                    ),
+                  ),
+                ],
+              ),
+              const SizedBox(height: 8),
+              Wrap(
+                spacing: 6,
+                runSpacing: 6,
+                children: _AnnotationNodeFilter.values
+                    .map(
+                      (entry) => _FilterChip(
+                        label: entry.label,
+                        active: annotationFilter == entry,
+                        onTap: () => onFilterChanged(entry),
+                      ),
+                    )
+                    .toList(growable: false),
+              ),
+              const SizedBox(height: 10),
+              LayoutBuilder(
+                builder: (context, constraints) {
+                  final stacked = constraints.maxWidth < 860;
+                  final treePane = _buildTreePane(
+                    visibleNodes: visibleNodes,
+                    query: query,
+                  );
+                  final detailsPane = _buildDetailsPane(
+                    selection: selection,
+                    locationLabel: locationLabel,
+                    ancestryLabel: ancestryLabel,
+                    recentTargets: recentTargets,
+                  );
+
+                  return SizedBox(
+                    height: stacked ? 480 : 320,
+                    child: stacked
+                        ? Column(
+                            children: [
+                              Expanded(child: treePane),
+                              const SizedBox(height: 10),
+                              Expanded(child: detailsPane),
+                            ],
+                          )
+                        : Row(
+                            children: [
+                              Expanded(flex: 11, child: treePane),
+                              const SizedBox(width: 10),
+                              Expanded(flex: 10, child: detailsPane),
+                            ],
+                          ),
+                  );
+                },
+              ),
+            ] else ...[
+              _buildDetailsPane(
+                selection: selection,
+                locationLabel: locationLabel,
+                ancestryLabel: ancestryLabel,
+                recentTargets: recentTargets,
+              ),
+            ],
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _buildTreePane({
+    required List<_VisibleAnnotationNode> visibleNodes,
+    required String query,
+  }) {
+    if (loadingSnapshot) {
+      return _panelShell(
+        child: const Center(
+          child: SizedBox(
+            width: 18,
+            height: 18,
+            child: CircularProgressIndicator(
+              strokeWidth: 1.5,
+              color: FloraPalette.accent,
+            ),
+          ),
+        ),
+      );
+    }
+
+    if (snapshot == null) {
+      return _panelShell(
+        child: _panelMessage(
+          icon: Icons.layers_clear_outlined,
+          title: 'No screen map yet',
+          subtitle:
+              'Refresh once the current frame settles. Flora will pull the active widget summary tree directly from the running app.',
+        ),
+      );
+    }
+
+    if (visibleNodes.isEmpty) {
+      return _panelShell(
+        child: _panelMessage(
+          icon: Icons.filter_alt_off_outlined,
+          title: 'No matching nodes',
+          subtitle: query.isEmpty
+              ? 'The current filter does not match anything in the captured tree.'
+              : 'Try a broader search term or switch the active filter.',
+        ),
+      );
+    }
+
+    return _panelShell(
+      child: ListView.separated(
+        padding: const EdgeInsets.all(8),
+        itemCount: visibleNodes.length,
+        separatorBuilder: (_, _) => const SizedBox(height: 4),
+        itemBuilder: (context, index) {
+          final entry = visibleNodes[index];
+          final node = entry.node;
+          final selected = selectedNode?.stableKey == node.stableKey;
+          final meta = _nodeMetaLabel(node);
+
+          return InkWell(
+            onTap: () => onSelectNode(node),
+            borderRadius: BorderRadius.circular(8),
+            child: Container(
+              padding: EdgeInsets.fromLTRB(
+                10 + (node.depth * 14).toDouble(),
+                8,
+                10,
+                8,
+              ),
+              decoration: BoxDecoration(
+                color: selected
+                    ? const Color(0x14007AFF)
+                    : entry.directMatch
+                    ? FloraPalette.background
+                    : FloraPalette.panelBg,
+                border: Border.all(
+                  color: selected ? FloraPalette.accent : FloraPalette.border,
+                ),
+                borderRadius: BorderRadius.circular(8),
+              ),
+              child: Row(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Icon(
+                    _nodeIcon(node),
+                    size: 14,
+                    color: selected
+                        ? FloraPalette.accent
+                        : FloraPalette.textSecondary,
+                  ),
+                  const SizedBox(width: 8),
+                  Expanded(
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Text(
+                          node.widgetName,
+                          style: TextStyle(
+                            color: entry.directMatch
+                                ? FloraPalette.textPrimary
+                                : FloraPalette.textSecondary,
+                            fontSize: 11,
+                            fontWeight: FontWeight.w700,
+                          ),
+                        ),
+                        if (node.textPreview != null &&
+                            node.textPreview!.trim().isNotEmpty) ...[
+                          const SizedBox(height: 2),
+                          Text(
+                            node.textPreview!,
+                            maxLines: 1,
+                            overflow: TextOverflow.ellipsis,
+                            style: const TextStyle(
+                              color: FloraPalette.textSecondary,
+                              fontSize: 10,
+                            ),
+                          ),
+                        ],
+                        const SizedBox(height: 3),
+                        Text(
+                          meta,
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                          style: FloraTheme.mono(
+                            size: 10,
+                            color: FloraPalette.textDimmed,
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                  if (selected)
+                    const Icon(
+                      Icons.check_circle,
+                      size: 14,
+                      color: FloraPalette.accent,
+                    ),
+                ],
+              ),
+            ),
+          );
+        },
+      ),
+    );
+  }
+
+  Widget _buildDetailsPane({
+    required InspectorSelectionContext? selection,
+    required String locationLabel,
+    required String? ancestryLabel,
+    required List<InspectorSelectionContext> recentTargets,
+  }) {
+    return _panelShell(
+      child: selectedNode == null || selection == null
+          ? Padding(
+              padding: const EdgeInsets.all(14),
+              child: _panelMessage(
+                icon: Icons.ads_click_outlined,
+                title: 'No target selected',
+                subtitle: mode == PreviewInteractionMode.annotate
+                    ? 'Pick a node from the screen map to inspect its layout, source, and screenshot.'
+                    : 'Switch to Annotate UI and target a node when you want scoped UI changes.',
+              ),
+            )
+          : SingleChildScrollView(
+              padding: const EdgeInsets.all(10),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Row(
+                    children: [
+                      Expanded(
+                        child: Text(
+                          selection.widgetName,
+                          style: const TextStyle(
+                            color: FloraPalette.textPrimary,
+                            fontSize: 12,
+                            fontWeight: FontWeight.w700,
+                          ),
+                        ),
+                      ),
+                      Text(
+                        _relativeTimestamp(selection.capturedAt),
+                        style: FloraTheme.mono(
+                          size: 10,
+                          color: FloraPalette.textSecondary,
+                        ),
+                      ),
+                    ],
+                  ),
+                  const SizedBox(height: 4),
+                  Text(
+                    selectedNode!.description,
+                    style: const TextStyle(
+                      color: FloraPalette.textSecondary,
+                      fontSize: 11,
+                      height: 1.35,
+                    ),
+                  ),
+                  const SizedBox(height: 8),
+                  Wrap(
+                    spacing: 6,
+                    runSpacing: 6,
+                    children: [
+                      _SelectionInfoChip(
+                        icon: Icons.insert_drive_file_outlined,
+                        text: locationLabel,
+                      ),
+                      if (ancestryLabel != null)
+                        _SelectionInfoChip(
+                          icon: Icons.account_tree_outlined,
+                          text: ancestryLabel,
+                        ),
+                      if (selectedLayoutDetails?.constraintsDescription != null)
+                        _SelectionInfoChip(
+                          icon: Icons.straighten_outlined,
+                          text: selectedLayoutDetails!.constraintsDescription!,
+                        ),
+                      if (selectedLayoutDetails?.width != null &&
+                          selectedLayoutDetails?.height != null)
+                        _SelectionInfoChip(
+                          icon: Icons.crop_free_outlined,
+                          text:
+                              '${selectedLayoutDetails!.width!.toStringAsFixed(0)} x ${selectedLayoutDetails!.height!.toStringAsFixed(0)}',
+                        ),
+                      if (selectedLayoutDetails?.flexFactor != null)
+                        _SelectionInfoChip(
+                          icon: Icons.view_stream_outlined,
+                          text:
+                              'flex ${selectedLayoutDetails!.flexFactor}${selectedLayoutDetails!.flexFit == null ? '' : ' ${selectedLayoutDetails!.flexFit}'}',
+                        ),
+                    ],
+                  ),
+                  const SizedBox(height: 10),
+                  if (loadingSelectionDetails)
+                    const LinearProgressIndicator(
+                      minHeight: 2,
+                      color: FloraPalette.accent,
+                      backgroundColor: FloraPalette.border,
+                    )
+                  else if (selectedScreenshotBytes != null)
+                    Container(
+                      width: double.infinity,
+                      height: 150,
+                      decoration: BoxDecoration(
+                        color: FloraPalette.background,
+                        border: Border.all(color: FloraPalette.border),
+                        borderRadius: BorderRadius.circular(8),
+                      ),
+                      clipBehavior: Clip.antiAlias,
+                      child: Image.memory(
+                        selectedScreenshotBytes!,
+                        fit: BoxFit.contain,
+                      ),
+                    )
+                  else
+                    Container(
+                      width: double.infinity,
+                      padding: const EdgeInsets.all(10),
+                      decoration: BoxDecoration(
+                        color: FloraPalette.background,
+                        border: Border.all(color: FloraPalette.border),
+                        borderRadius: BorderRadius.circular(8),
+                      ),
+                      child: const Text(
+                        'No screenshot preview is available for this node yet.',
+                        style: TextStyle(
+                          color: FloraPalette.textSecondary,
+                          fontSize: 11,
+                        ),
+                      ),
+                    ),
+                  const SizedBox(height: 10),
+                  Wrap(
+                    spacing: 6,
+                    runSpacing: 6,
+                    children: [
+                      if (onFocusSource != null)
+                        _TrayActionButton(
+                          label: 'Focus Source',
+                          icon: Icons.code_outlined,
+                          onTap: onFocusSource,
+                        ),
+                      if (onClearSelection != null)
+                        _TrayActionButton(
+                          label: 'Clear Target',
+                          icon: Icons.close,
+                          onTap: onClearSelection,
+                        ),
+                      for (final template in _annotationPromptTemplates)
+                        _TrayActionButton(
+                          label: template.title,
+                          icon: Icons.auto_awesome_outlined,
+                          tooltip: template.summary,
+                          onTap: onQueuePrompt == null
+                              ? null
+                              : () => onQueuePrompt!(template),
+                        ),
+                    ],
+                  ),
+                  if (recentTargets.isNotEmpty) ...[
+                    const SizedBox(height: 12),
+                    const Text(
+                      'Recent targets',
+                      style: TextStyle(
+                        color: FloraPalette.textSecondary,
+                        fontSize: 10,
+                        fontWeight: FontWeight.w600,
+                        letterSpacing: 0.3,
+                      ),
+                    ),
+                    const SizedBox(height: 6),
+                    Wrap(
+                      spacing: 6,
+                      runSpacing: 6,
+                      children: recentTargets
+                          .map(
+                            (entry) => _RecentTargetChip(
+                              selection: entry,
+                              onTap: () => onSelectHistory(entry),
+                            ),
+                          )
+                          .toList(growable: false),
+                    ),
+                  ],
+                ],
+              ),
+            ),
+    );
+  }
+
+  Widget _panelShell({required Widget child}) {
+    return Container(
+      decoration: BoxDecoration(
+        color: FloraPalette.background,
+        border: Border.all(color: FloraPalette.border),
+        borderRadius: BorderRadius.circular(8),
+      ),
+      child: child,
+    );
+  }
+
+  Widget _panelMessage({
+    required IconData icon,
+    required String title,
+    required String subtitle,
+  }) {
+    return Center(
+      child: Padding(
+        padding: const EdgeInsets.all(14),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Icon(icon, size: 18, color: FloraPalette.textDimmed),
+            const SizedBox(height: 8),
+            Text(
+              title,
+              style: const TextStyle(
+                color: FloraPalette.textPrimary,
+                fontSize: 11,
+                fontWeight: FontWeight.w700,
+              ),
+              textAlign: TextAlign.center,
+            ),
+            const SizedBox(height: 4),
+            Text(
+              subtitle,
+              style: const TextStyle(
+                color: FloraPalette.textSecondary,
+                fontSize: 11,
+                height: 1.4,
+              ),
+              textAlign: TextAlign.center,
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  List<_VisibleAnnotationNode> _visibleEntriesFor(
+    InspectorTreeNode node, {
+    required String query,
+    required _AnnotationNodeFilter filter,
+  }) {
+    final children = node.children
+        .expand(
+          (child) => _visibleEntriesFor(child, query: query, filter: filter),
+        )
+        .toList(growable: false);
+    final directMatch = _nodeMatches(node, query: query, filter: filter);
+    if (!directMatch && children.isEmpty) {
+      return const <_VisibleAnnotationNode>[];
+    }
+    return <_VisibleAnnotationNode>[
+      _VisibleAnnotationNode(node: node, directMatch: directMatch),
+      ...children,
+    ];
+  }
+
+  bool _nodeMatches(
+    InspectorTreeNode node, {
+    required String query,
+    required _AnnotationNodeFilter filter,
+  }) {
+    if (!_matchesFilter(node, filter)) {
+      return false;
+    }
+    if (query.isEmpty) {
+      return true;
+    }
+
+    final haystack = <String>[
+      node.widgetName,
+      node.description,
+      node.textPreview ?? '',
+      node.sourceFile == null ? '' : p.basename(node.sourceFile!),
+    ].join(' ').toLowerCase();
+    return haystack.contains(query);
+  }
+
+  bool _matchesFilter(InspectorTreeNode node, _AnnotationNodeFilter filter) {
+    final name = node.widgetName.toLowerCase();
+    switch (filter) {
+      case _AnnotationNodeFilter.layout:
+        return _containsAny(name, const <String>{
+          'scaffold',
+          'container',
+          'column',
+          'row',
+          'stack',
+          'padding',
+          'align',
+          'center',
+          'sizedbox',
+          'flex',
+          'expanded',
+          'flexible',
+          'wrap',
+          'listview',
+          'gridview',
+          'scrollview',
+          'sliver',
+          'positioned',
+          'safearea',
+          'card',
+          'decoratedbox',
+          'coloredbox',
+          'clip',
+          'constrainedbox',
+          'fractionallysizedbox',
+          'aspectratio',
+        });
+      case _AnnotationNodeFilter.controls:
+        return _containsAny(name, const <String>{
+          'button',
+          'textfield',
+          'textformfield',
+          'switch',
+          'checkbox',
+          'radio',
+          'slider',
+          'dropdown',
+          'popupmenu',
+          'gesture',
+          'inkwell',
+          'listtile',
+          'tabbar',
+          'segmentedbutton',
+          'floatingactionbutton',
+          'iconbutton',
+        });
+      case _AnnotationNodeFilter.text:
+        return _containsAny(name, const <String>{
+          'text',
+          'richtext',
+          'selectabletext',
+          'editabletext',
+        });
+      case _AnnotationNodeFilter.all:
+        return true;
+    }
+  }
+
+  bool _containsAny(String value, Set<String> fragments) {
+    return fragments.any(value.contains);
+  }
+
+  IconData _nodeIcon(InspectorTreeNode node) {
+    final name = node.widgetName.toLowerCase();
+    if (_containsAny(name, const <String>{
+      'text',
+      'richtext',
+      'editabletext',
+    })) {
+      return Icons.text_fields;
+    }
+    if (_containsAny(name, const <String>{'button', 'textfield', 'switch'})) {
+      return Icons.smart_button_outlined;
+    }
+    if (_containsAny(name, const <String>{'row', 'column', 'stack', 'flex'})) {
+      return Icons.view_quilt_outlined;
+    }
+    return Icons.widgets_outlined;
+  }
+
+  String _nodeMetaLabel(InspectorTreeNode node) {
+    final sourceFile = node.sourceFile;
+    final fileLabel = sourceFile == null || sourceFile.trim().isEmpty
+        ? 'framework node'
+        : p.basename(sourceFile);
+    final line = node.line;
+    if (line == null) {
+      return fileLabel;
+    }
+    return '$fileLabel:$line';
+  }
+
+  static bool _sameSelection(
+    InspectorSelectionContext entry,
+    InspectorSelectionContext? current,
+  ) {
+    if (current == null) {
+      return false;
+    }
+
+    return entry.sourceFile == current.sourceFile &&
+        entry.line == current.line &&
+        entry.endLine == current.endLine &&
+        entry.column == current.column &&
+        entry.widgetName == current.widgetName;
+  }
+
+  static String _selectionLocation(InspectorSelectionContext? selection) {
+    if (selection == null) {
+      return 'No source location';
+    }
+
+    final sourceFile = selection.sourceFile;
+    final fileLabel = sourceFile == null || sourceFile.trim().isEmpty
+        ? 'unknown file'
+        : p.basename(sourceFile);
+    final startLine = selection.line;
+    final endLine = selection.endLine;
+    if (startLine == null) {
+      return fileLabel;
+    }
+    if (endLine != null && endLine >= startLine) {
+      return '$fileLabel:$startLine-$endLine';
+    }
+    return '$fileLabel:$startLine';
+  }
+
+  static String _relativeTimestamp(DateTime capturedAt) {
+    final delta = DateTime.now().difference(capturedAt);
+    if (delta.inSeconds < 10) {
+      return 'just now';
+    }
+    if (delta.inMinutes < 1) {
+      return '${delta.inSeconds}s ago';
+    }
+    if (delta.inHours < 1) {
+      return '${delta.inMinutes}m ago';
+    }
+    return '${delta.inHours}h ago';
+  }
+}
+
+class _VisibleAnnotationNode {
+  const _VisibleAnnotationNode({required this.node, required this.directMatch});
+
+  final InspectorTreeNode node;
+  final bool directMatch;
+}
+
+class _FilterChip extends StatelessWidget {
+  const _FilterChip({
+    required this.label,
+    required this.active,
+    required this.onTap,
+  });
+
+  final String label;
+  final bool active;
+  final VoidCallback onTap;
+
+  @override
+  Widget build(BuildContext context) {
+    return InkWell(
+      onTap: onTap,
+      borderRadius: BorderRadius.circular(999),
+      child: Container(
+        padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 7),
+        decoration: BoxDecoration(
+          color: active ? FloraPalette.accent : FloraPalette.background,
+          border: Border.all(color: FloraPalette.border),
+          borderRadius: BorderRadius.circular(999),
+        ),
+        child: Text(
+          label,
+          style: TextStyle(
+            color: active ? Colors.white : FloraPalette.textSecondary,
+            fontSize: 10,
+            fontWeight: FontWeight.w700,
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+class _SelectionInfoChip extends StatelessWidget {
+  const _SelectionInfoChip({required this.icon, required this.text});
+
+  final IconData icon;
+  final String text;
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      constraints: const BoxConstraints(maxWidth: 280),
+      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 5),
+      decoration: BoxDecoration(
+        color: FloraPalette.panelBg,
+        border: Border.all(color: FloraPalette.border),
+        borderRadius: BorderRadius.circular(999),
+      ),
+      child: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Icon(icon, size: 12, color: FloraPalette.textSecondary),
+          const SizedBox(width: 5),
+          Flexible(
+            child: Text(
+              text,
+              overflow: TextOverflow.ellipsis,
+              style: FloraTheme.mono(
+                size: 10,
+                color: FloraPalette.textSecondary,
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class _TrayActionButton extends StatelessWidget {
+  const _TrayActionButton({
+    required this.label,
+    required this.icon,
+    this.tooltip,
+    this.onTap,
+  });
+
+  final String label;
+  final IconData icon;
+  final String? tooltip;
+  final VoidCallback? onTap;
+
+  @override
+  Widget build(BuildContext context) {
+    final content = InkWell(
+      onTap: onTap,
+      borderRadius: BorderRadius.circular(999),
+      child: Container(
+        padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 7),
+        decoration: BoxDecoration(
+          color: onTap == null ? FloraPalette.border : FloraPalette.background,
+          border: Border.all(color: FloraPalette.border),
+          borderRadius: BorderRadius.circular(999),
+        ),
+        child: Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Icon(icon, size: 12, color: FloraPalette.textSecondary),
+            const SizedBox(width: 6),
+            Text(
+              label,
+              style: TextStyle(
+                color: onTap == null
+                    ? FloraPalette.textDimmed
+                    : FloraPalette.textPrimary,
+                fontSize: 11,
+                fontWeight: FontWeight.w600,
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+
+    if (tooltip == null || tooltip!.trim().isEmpty) {
+      return content;
+    }
+
+    return Tooltip(message: tooltip!, child: content);
+  }
+}
+
+class _RecentTargetChip extends StatelessWidget {
+  const _RecentTargetChip({required this.selection, required this.onTap});
+
+  final InspectorSelectionContext selection;
+  final VoidCallback onTap;
+
+  @override
+  Widget build(BuildContext context) {
+    final location = _AnnotationWorkbench._selectionLocation(selection);
+
+    return InkWell(
+      onTap: onTap,
+      borderRadius: BorderRadius.circular(999),
+      child: Container(
+        constraints: const BoxConstraints(maxWidth: 260),
+        padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 7),
+        decoration: BoxDecoration(
+          color: FloraPalette.background,
+          border: Border.all(color: FloraPalette.border),
+          borderRadius: BorderRadius.circular(999),
+        ),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Text(
+              selection.widgetName,
+              overflow: TextOverflow.ellipsis,
+              style: const TextStyle(
+                color: FloraPalette.textPrimary,
+                fontSize: 11,
+                fontWeight: FontWeight.w700,
+              ),
+            ),
+            const SizedBox(height: 2),
+            Text(
+              location,
+              overflow: TextOverflow.ellipsis,
+              style: FloraTheme.mono(
+                size: 10,
+                color: FloraPalette.textSecondary,
+              ),
+            ),
+          ],
         ),
       ),
     );

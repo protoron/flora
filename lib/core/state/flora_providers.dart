@@ -127,10 +127,25 @@ final inspectorSelectionProvider = StateProvider<InspectorSelectionContext?>(
   (ref) => null,
 );
 
+/// Recently targeted widgets kept for quick annotation follow-ups.
+final inspectorSelectionHistoryProvider =
+    StateProvider<List<InspectorSelectionContext>>((ref) => const []);
+
+/// Whether the preview is in normal interaction mode or UI targeting mode.
+final previewInteractionModeProvider = StateProvider<PreviewInteractionMode>((
+  ref,
+) {
+  return PreviewInteractionMode.use;
+});
+
 // ─── Chat ─────────────────────────────────────────────────────────────────────
 
 final chatHistoryProvider = StateProvider<List<ChatMessage>>((ref) => const []);
-final chatLoadingProvider = StateProvider<bool>((ref) => false);
+final chatActiveRequestCountProvider = StateProvider<int>((ref) => 0);
+final chatLoadingProvider = Provider<bool>((ref) {
+  return ref.watch(chatActiveRequestCountProvider) > 0;
+});
+final chatComposerTextProvider = StateProvider<String>((ref) => '');
 
 // ─── File Explorer ────────────────────────────────────────────────────────────
 

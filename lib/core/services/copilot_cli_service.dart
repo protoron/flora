@@ -39,7 +39,43 @@ class CopilotCliStatus {
 class CopilotCliService {
   const CopilotCliService._();
 
-  static Future<CopilotCliStatus> inspectStatus() async {
+  static const Duration _statusCacheTtl = Duration(seconds: 8);
+  static CopilotCliStatus? _cachedStatus;
+  static DateTime? _cachedStatusAt;
+  static Future<CopilotCliStatus>? _statusProbe;
+
+  static Future<CopilotCliStatus> inspectStatus({bool forceRefresh = false}) {
+    final now = DateTime.now();
+    if (!forceRefresh &&
+        _cachedStatus != null &&
+        _cachedStatusAt != null &&
+        now.difference(_cachedStatusAt!) <= _statusCacheTtl) {
+      return Future.value(_cachedStatus!);
+    }
+
+    if (!forceRefresh && _statusProbe != null) {
+      return _statusProbe!;
+    }
+
+    final probe = _inspectStatusUncached();
+    _statusProbe = probe
+        .then((status) {
+          _cachedStatus = status;
+          _cachedStatusAt = DateTime.now();
+          return status;
+        })
+        .whenComplete(() {
+          _statusProbe = null;
+        });
+    return _statusProbe!;
+  }
+
+  static void invalidateStatusCache() {
+    _cachedStatus = null;
+    _cachedStatusAt = null;
+  }
+
+  static Future<CopilotCliStatus> _inspectStatusUncached() async {
     try {
       final directVersion = await Process.run('copilot', const [
         '--version',
@@ -137,6 +173,9 @@ class CopilotCliService {
       );
     }
 
+    if (result.success) {
+      invalidateStatusCache();
+    }
     return result;
   }
 
@@ -208,6 +247,8 @@ class CopilotCliService {
         stdout: '',
         stderr: error.message,
       );
+    } finally {
+      invalidateStatusCache();
     }
   }
 
@@ -285,7 +326,7 @@ class CopilotCliService {
           'Modify local files if needed instead of only describing the change.',
         )
         ..writeln(
-          'Prefer apply_patch and file edit tools for local changes. Avoid shell-based file writes on Windows.',
+          'Prefer create/edit file tools for local changes before using shell commands.',
         )
         ..writeln('Return a concise summary of the result when finished.');
 
@@ -990,19 +1031,19 @@ class CopilotCliService {
       case CopilotPermissionMode.readOnly:
         break;
       case CopilotPermissionMode.workspaceWrite:
-        // GitHub's CLI requires auto-approval in prompt mode; pre-approve all
-        // tools while keeping file access constrained to the working dir and
-        // explicitly added directories.
+        // GitHub's CLI requires auto-approval in prompt mode.
         arguments.add('--allow-all-tools');
+        if (Platform.isWindows) {
+          // On Windows, Copilot may choose shell tools that depend on pwsh.
+          // Deny shell in workspace mode so file edits use native file tools.
+          arguments.add('--deny-tool');
+          arguments.add('shell');
+        }
         break;
       case CopilotPermissionMode.fullAuto:
         arguments.add('--allow-all-tools');
         arguments.add('--allow-all-paths');
         break;
-    }
-
-    if (Platform.isWindows) {
-      arguments.add('--excluded-tools=powershell');
     }
 
     return arguments;

@@ -8,6 +8,8 @@ enum AssistantProviderType { codex, copilot }
 
 enum CopilotPermissionMode { readOnly, workspaceWrite, fullAuto }
 
+enum PreviewInteractionMode { use, annotate }
+
 /// Feature flag for enabling or disabling Codex integration in Flora.
 const bool codexIntegrationEnabled = true;
 
@@ -104,9 +106,38 @@ extension CopilotPermissionModeX on CopilotPermissionMode {
       case CopilotPermissionMode.readOnly:
         return 'No write auto-approval. In Flora prompt mode, edit requests will be denied.';
       case CopilotPermissionMode.workspaceWrite:
-        return 'Auto-approve tools for non-interactive runs while keeping file access limited to the project directory and explicitly allowed paths.';
+        return 'Auto-approve tools for non-interactive runs while keeping file access limited to the project directory and explicitly allowed paths. On Windows, direct shell execution is denied in this mode so edits use native file tools.';
       case CopilotPermissionMode.fullAuto:
         return 'Auto-approve all tools and paths for the current session.';
+    }
+  }
+}
+
+extension PreviewInteractionModeX on PreviewInteractionMode {
+  String get key {
+    switch (this) {
+      case PreviewInteractionMode.use:
+        return 'use';
+      case PreviewInteractionMode.annotate:
+        return 'annotate';
+    }
+  }
+
+  String get label {
+    switch (this) {
+      case PreviewInteractionMode.use:
+        return 'Use App';
+      case PreviewInteractionMode.annotate:
+        return 'Annotate UI';
+    }
+  }
+
+  String get helperText {
+    switch (this) {
+      case PreviewInteractionMode.use:
+        return 'Interact with the running app normally. Your last UI target stays attached for chat until you clear it.';
+      case PreviewInteractionMode.annotate:
+        return 'Browse a Flora-owned screen map of the current widget tree, then target the right layout container without freezing the app preview.';
     }
   }
 }
@@ -239,6 +270,98 @@ class InspectorSelectionContext {
   final int? column;
   final List<String> ancestorPath;
   final DateTime capturedAt;
+}
+
+class InspectorTreeSnapshot {
+  const InspectorTreeSnapshot({
+    required this.groupName,
+    required this.capturedAt,
+    required this.rootNodes,
+    required this.totalNodeCount,
+    required this.layoutNodeCount,
+    required this.controlNodeCount,
+    required this.textNodeCount,
+  });
+
+  final String groupName;
+  final DateTime capturedAt;
+  final List<InspectorTreeNode> rootNodes;
+  final int totalNodeCount;
+  final int layoutNodeCount;
+  final int controlNodeCount;
+  final int textNodeCount;
+}
+
+class InspectorTreeNode {
+  const InspectorTreeNode({
+    required this.valueId,
+    required this.stableKey,
+    required this.widgetName,
+    required this.description,
+    required this.textPreview,
+    required this.sourceFile,
+    required this.line,
+    required this.endLine,
+    required this.column,
+    required this.createdByLocalProject,
+    required this.ancestorPath,
+    required this.depth,
+    required this.children,
+  });
+
+  final String? valueId;
+  final String stableKey;
+  final String widgetName;
+  final String description;
+  final String? textPreview;
+  final String? sourceFile;
+  final int? line;
+  final int? endLine;
+  final int? column;
+  final bool createdByLocalProject;
+  final List<String> ancestorPath;
+  final int depth;
+  final List<InspectorTreeNode> children;
+
+  InspectorSelectionContext toSelectionContext() {
+    return InspectorSelectionContext(
+      valueId: valueId,
+      widgetName: widgetName,
+      description: description,
+      sourceFile: sourceFile,
+      line: line,
+      endLine: endLine,
+      column: column,
+      ancestorPath: ancestorPath,
+      capturedAt: DateTime.now(),
+    );
+  }
+}
+
+class InspectorNodeLayoutDetails {
+  const InspectorNodeLayoutDetails({
+    required this.constraintsDescription,
+    required this.width,
+    required this.height,
+    required this.flexFactor,
+    required this.flexFit,
+    required this.offsetX,
+    required this.offsetY,
+    required this.textPreview,
+    required this.renderObjectDescription,
+    required this.parentRenderElementDescription,
+  });
+
+  final String? constraintsDescription;
+  final double? width;
+  final double? height;
+  final int? flexFactor;
+  final String? flexFit;
+  final double? offsetX;
+  final double? offsetY;
+  final String? textPreview;
+  final String? renderObjectDescription;
+  final String? parentRenderElementDescription;
 }
 
 class AssistantExecutionUpdate {
